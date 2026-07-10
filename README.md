@@ -4,5 +4,7 @@ Sound-reactive Chladni plate particle simulation using blender Sample Sound Freq
 use audio quality bitrate 170-210 kbps for smooth playback
 
 Minimum blender-version 4.2
+
+
 ![description](./images/cymage.png)
 ![description](./images/cymage2.png)
