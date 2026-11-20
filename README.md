@@ -48,5 +48,5 @@ The moment the music changes pitch: the plate jumps to a new resonance, sand lea
 
 ## Performance
 - **Simulation:** about 0.1 s per frame per 100k grains, measured on 4 CPU cores. Bake before rendering.
-- **Rendering:** a 1080p hero frame is about a minute on a desktop GPU. Instanced grains share 8 meshes, so memory stays low.
+- **Rendering:** a 1080p, 128-sample hero frame took about 8 minutes on 4 CPU cores; a desktop GPU should be much faster (not measured). Instanced grains share 8 meshes, so memory stays low.
 - **Viewport:** if playback is too slow, lower *Grain Count* or *Substeps* in the modifier. Changing *Grain Count* takes effect from the first frame.
