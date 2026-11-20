@@ -599,7 +599,9 @@ def build_grain_step_group(chladni, sampler):
     sjx, sjy, _ = b.sep(sj)
     # vibration creep: below 1 g grains still slide/roll down the oscillating
     # plate tilt towards the nodal line (stalls where the plate is still)
-    creep = b.mul(b.mul(b.clamp01(b.sub(gamma, 0.3)), I["Creep"]), dt)
+    dist = b.div(b.m('ABSOLUTE', F), b.mx(b.v('LENGTH', gradF), 1e-6))
+    creep = b.mn(b.mul(b.mul(b.clamp01(gamma), I["Creep"]), dt),
+                 b.mx(b.sub(dist, b.mul(r, 0.5)), 0.0))
     cx = b.mul(tx, creep)
     cy = b.mul(ty, creep)
     rx2 = b.add(b.madd(sjx, shiver, px),
@@ -615,16 +617,22 @@ def build_grain_step_group(chladni, sampler):
     ovz = b.switch('FLOAT', flying, 0.0, fvz)
 
     geo = I["Grains"]
-    geo = b.store(geo, "cf_vel", b.xyz(ovx, ovy, ovz), 'FLOAT_VECTOR')
-    # tumble while airborne
     rot = b.named("cf_rot", 'FLOAT_VECTOR')
     spin = b.named("cf_spin", 'FLOAT_VECTOR')
-    geo = b.store(geo, "cf_rot", b.v('ADD', rot, b.v('SCALE', spin, scale=dt)),
-                  'FLOAT_VECTOR', sel=flying)
-    # once a grain is below the plate top it has spilled for good
-    gone = b.OR(off, b.lt(pz, -0.0015))
-    geo = b.store(geo, "cf_off", gone, 'BOOLEAN')
-    geo = b.set_pos(geo, position=b.xyz(outx, outy, outz))
+    cap = b.node("GeometryNodeCaptureAttribute", domain='POINT')
+    for typ, nm in (('VECTOR', "Pos"), ('VECTOR', "Vel"), ('VECTOR', "Rot"), ('BOOLEAN', "Off")):
+        cap.capture_items.new(typ, nm)
+    b.feed(cap.inputs["Geometry"], geo)
+    b.feed(cap.inputs["Pos"], b.xyz(outx, outy, outz))
+    b.feed(cap.inputs["Vel"], b.xyz(ovx, ovy, ovz))
+    b.feed(cap.inputs["Rot"], b.switch('VECTOR', flying, rot,
+                                       b.v('ADD', rot, b.v('SCALE', spin, scale=dt))))
+    b.feed(cap.inputs["Off"], b.OR(off, b.lt(pz, -0.0015)))
+    geo = cap.outputs["Geometry"]
+    geo = b.store(geo, "cf_vel", cap.outputs["Vel"], 'FLOAT_VECTOR')
+    geo = b.store(geo, "cf_rot", cap.outputs["Rot"], 'FLOAT_VECTOR')
+    geo = b.store(geo, "cf_off", cap.outputs["Off"], 'BOOLEAN')
+    geo = b.set_pos(geo, position=cap.outputs["Pos"])
     b.L.new(geo, go.inputs[0])
     _layout(tree)
     return tree
@@ -743,7 +751,7 @@ MAIN_INPUTS = (
     ("Physics", "Angle of Repose", 'NodeSocketFloat', 33.0, 5.0, 60.0,
      "Steepest stable pile slope in degrees (dry sand ~30-35)"),
     ("Physics", "Substeps", 'NodeSocketInt', 6, 1, 64,
-     "Physics sub-steps per frame"),
+     "Physics sub-steps per 1/24 s (scaled automatically for other frame rates)"),
     ("Physics", "Table Height", 'NodeSocketFloat', 0.14, 0.0, 10.0,
      "Drop from the plate top to the table where spilled sand lands"),
     ("Plate", "Plate Size", 'NodeSocketFloat', 0.30, 0.01, 100.0,
@@ -791,7 +799,9 @@ def build_main_tree(name, grain_shapes_tree):
     go = b.node("NodeGroupOutput")
 
     Lh = b.mul(I["Plate Size"], 0.5)
-    G = I["Pile Resolution"]
+    # cells must be at least ~2.5 grain radii wide or one grain makes a spike
+    G = b.mx(b.mn(I["Pile Resolution"],
+                  b.m('FLOOR', b.add(b.div(I["Plate Size"], b.mul(I["Grain Radius"], 2.5)), 1.0))), 16.0)
     table_z = b.mul(I["Table Height"], -1.0)
     repose_tan = b.m('TANGENT', b.m('RADIANS', I["Angle of Repose"]))
 
@@ -854,7 +864,6 @@ def build_main_tree(name, grain_shapes_tree):
     b.L.new(grains, sim_in.inputs["Geometry"])
     sim_in.inputs["Env"].default_value = 0.0
     sim_in.inputs["Peak"].default_value = 1e-3
-    sim_in.inputs["BassSlow"].default_value = 0.0
     sim_in.inputs["BassPeak"].default_value = 1e-3
     b.L.new(b.add(I["Mode Min"], 0.0), sim_in.inputs["Mode"])
 
@@ -866,8 +875,10 @@ def build_main_tree(name, grain_shapes_tree):
     st = b.node("GeometryNodeInputSceneTime")
     secs = st.outputs["Seconds"]
     frame = st.outputs["Frame"]
-    t0 = b.sub(secs, b.m('DIVIDE', secs, b.mx(frame, 1.0)))
-    t_audio = b.add(t0, I["Audio Offset"])
+    sim_out.state_items.new('FLOAT', "T0")
+    b.L.new(secs, sim_in.inputs["T0"])
+    b.L.new(S["T0"], sim_out.inputs["T0"])
+    t_audio = b.add(b.sub(secs, S["T0"]), I["Audio Offset"])
     au = b.group(audio, **{"Sound": I["Sound"], "Time": t_audio,
                            "Low Hz": I["Pitch Low Hz"], "High Hz": I["Pitch High Hz"],
                            "Bass Low Hz": I["Bass Low Hz"],
@@ -889,8 +900,9 @@ def build_main_tree(name, grain_shapes_tree):
     env = b.madd(b.sub(level, env_prev), b.sub(1.0, decay(tau)), env_prev)
     # bass transient
     bpeak = b.mx(b.mx(bass, b.mul(S["BassPeak"], decay(10.0))), 1e-4)
-    bslow = b.madd(b.sub(bass, S["BassSlow"]), b.sub(1.0, decay(0.35)),
-                   S["BassSlow"])
+    # first frame: start the slow bass follower at the current bass level
+    bs_prev = b.switch('FLOAT', b.gt(dtf, 0.0), bass, S["BassSlow"])
+    bslow = b.madd(b.sub(bass, bs_prev), b.sub(1.0, decay(0.35)), bs_prev)
     punch = b.clamp01(b.div(b.mx(b.sub(bass, bslow), 0.0), bpeak))
     drive = b.madd(punch, I["Bass Punch"],
                    b.mul(b.m('POWER', env, 1.3), I["Drive"]))
@@ -915,7 +927,10 @@ def build_main_tree(name, grain_shapes_tree):
     rin = b.node("GeometryNodeRepeatInput")
     rout = b.node("GeometryNodeRepeatOutput")
     rin.pair_with_output(rout)
-    b.feed(rin.inputs["Iterations"], I["Substeps"])
+    # Substeps are defined per 1/24 s so the time resolution (and cost per
+    # second) is the same at any frame rate.
+    b.feed(rin.inputs["Iterations"],
+           b.mx(b.m('CEIL', b.mul(b.mul(I["Substeps"], dtf), 24.0)), 1.0))
     b.L.new(geo_prev, rin.inputs["Geometry"])
     sub_dt = b.div(dtf, b.mx(b.add(I["Substeps"], 0.0), 1.0))
     seed_i = b.imath('ADD', b.imath('MULTIPLY', b.m('ROUND', frame), 131),
@@ -1138,6 +1153,7 @@ def _set_input(mod, name, value):
             owner.value = value
         else:
             owner[prop[2:-2]] = value
+        mod.id_data.update_tag()
         return True
     except (TypeError, ValueError, AttributeError):
         for it in mod.node_group.interface.items_tree:
@@ -1169,8 +1185,15 @@ class CYMATICS_OT_build(bpy.types.Operator):
         if not p.sound_path:
             self.report({'ERROR'}, "Pick an audio file first")
             return {'CANCELLED'}
+        path = bpy.path.abspath(p.sound_path)
         try:
-            sound = bpy.data.sounds.load(bpy.path.abspath(p.sound_path),
+            import aud
+            aud.Sound(path).specs   # raises on missing/corrupt files
+        except Exception as e:
+            self.report({'ERROR'}, f"Could not read audio: {e}")
+            return {'CANCELLED'}
+        try:
+            sound = bpy.data.sounds.load(path,
                                          check_existing=True)
         except RuntimeError as e:
             self.report({'ERROR'}, f"Could not load audio: {e}")
@@ -1179,6 +1202,7 @@ class CYMATICS_OT_build(bpy.types.Operator):
             self.report({'ERROR'}, "Needs Blender 5.2+ (Sample Sound Frequencies node)")
             return {'CANCELLED'}
 
+        self._remove_previous(scene)
         coll = bpy.data.collections.new("Cymatic Forge")
         scene.collection.children.link(coll)
 
@@ -1225,17 +1249,48 @@ class CYMATICS_OT_build(bpy.types.Operator):
         self.report({'INFO'}, "Cymatic plate built - press Play (or bake) to run")
         return {'FINISHED'}
 
+    @staticmethod
+    def _remove_previous(scene):
+        """Rebuilding replaces the previous plate instead of stacking copies."""
+        for coll in [c for c in bpy.data.collections
+                     if c.name.startswith("Cymatic Forge")]:
+            for ob in list(coll.objects):
+                data = ob.data
+                bpy.data.objects.remove(ob, do_unlink=True)
+                if data is not None and data.users == 0:
+                    if isinstance(data, bpy.types.Mesh):
+                        bpy.data.meshes.remove(data)
+                    elif isinstance(data, bpy.types.Camera):
+                        bpy.data.cameras.remove(data)
+                    elif isinstance(data, bpy.types.Light):
+                        bpy.data.lights.remove(data)
+            bpy.data.collections.remove(coll)
+        for ng in [g for g in bpy.data.node_groups
+                   if (g.name.startswith(PREFIX) or g.name.startswith("CymaticSim"))
+                   and g.users == 0]:
+            bpy.data.node_groups.remove(ng)
+        # nested groups lose their users only once their parents are gone
+        for ng in [g for g in bpy.data.node_groups
+                   if g.name.startswith(PREFIX) and g.users == 0]:
+            bpy.data.node_groups.remove(ng)
+        for mat in [m for m in bpy.data.materials
+                    if m.name.startswith(PREFIX) and m.users == 0]:
+            bpy.data.materials.remove(mat)
+
     def _setup_audio_playback(self, scene, p):
         try:
             se = scene.sequence_editor or scene.sequence_editor_create()
-            coll = getattr(se, "strips", None) or getattr(se, "sequences", None)
-            strip = coll.new_sound("CymaticAudio", bpy.path.abspath(p.sound_path),
-                                   1, scene.frame_start)
-            dur = getattr(strip, "frame_final_duration", 0)
-            if dur:
-                scene.frame_end = scene.frame_start + int(dur) - 1
-        except Exception:
-            pass
+            strips = se.strips if hasattr(se, "strips") else se.sequences
+            old = strips.get("CymaticAudio")
+            if old is not None:
+                strips.remove(old)
+            strip = strips.new_sound("CymaticAudio", bpy.path.abspath(p.sound_path),
+                                     1, scene.frame_start)
+            dur = int(strip.frame_final_end - strip.frame_final_start)
+            if dur > 0:
+                scene.frame_end = scene.frame_start + dur - 1
+        except (AttributeError, RuntimeError, TypeError) as e:
+            print("Cymatic Forge: could not add audio strip:", e)
         try:
             scene.sync_mode = 'AUDIO_SYNC'
         except Exception:
@@ -1313,7 +1368,8 @@ class CYMATICS_PT_panel(bpy.types.Panel):
                 if owner is not None:
                     box.prop(owner, prop, text=nm)
             col.operator("cymatics.bake", icon='FILE_CACHE')
-        col.label(text="Play from frame 1; bake to scrub/render.", icon='INFO')
+        col.label(text="Play from the start frame; bake to scrub/render.",
+                  icon='INFO')
 
 
 classes = (CymaticProps, CYMATICS_OT_build, CYMATICS_OT_bake, CYMATICS_PT_panel)
