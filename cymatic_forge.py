@@ -11,6 +11,7 @@ bl_info = {
 
 import bpy
 import math
+import random
 from bpy.props import (
     StringProperty, FloatProperty, IntProperty, BoolProperty,
     EnumProperty, PointerProperty,
@@ -1031,49 +1032,1111 @@ def build_main_tree(name, grain_shapes_tree):
 
 
 # ======================================================================
-#  LOOK (materials, grain shapes, studio) - placeholder, replaced later
+#  LOOK: grain shapes, materials, studio apparatus, lights, cameras
+#  (fully procedural - no image textures or HDRIs)
 # ======================================================================
 
-def build_grain_shapes(kind):
-    tree, b, gi, go = _new_group(PREFIX + "Grain Shapes " + kind.title(),
-                                 outputs=(("Instances", 'NodeSocketGeometry'),))
-    join = b.node("GeometryNodeJoinGeometry")
-    for i in range(6):
-        ico = b.node("GeometryNodeMeshIcoSphere")
-        ico.inputs["Radius"].default_value = 1.0
-        ico.inputs["Subdivisions"].default_value = 2
-        gti = b.node("GeometryNodeGeometryToInstance")
-        b.L.new(ico.outputs["Mesh"], gti.inputs[0])
-        b.L.new(gti.outputs[0], join.inputs[0])
-    b.L.new(join.outputs[0], go.inputs[0])
-    _layout(tree)
-    return tree
+BUMPD = 0.04  # Bump distance acts in instance object space (grain radius == 1)
 
 
-def make_grain_material(kind):
-    mat = bpy.data.materials.new(PREFIX + "Grain")
-    return mat
+# ---------------------------------------------------------------------------
+# small node helpers
+# ---------------------------------------------------------------------------
+
+def _clear(nt):
+    for n in list(nt.nodes):
+        nt.nodes.remove(n)
 
 
-def make_fill_material(kind):
-    return bpy.data.materials.new(PREFIX + "Pile")
+def _n(nt, typ, x=0, y=0, label=None, **props):
+    n = nt.nodes.new(typ)
+    n.location = (x, y)
+    if label:
+        n.label = label
+    for k, v in props.items():
+        setattr(n, k, v)
+    return n
 
 
-def make_plate_material(finish):
-    return bpy.data.materials.new(PREFIX + "Plate")
+def _set(sock, val):
+    sock.default_value = val
 
 
-def build_studio(scene, plate_size, plate_z, finish, collection, full=True):
-    me = bpy.data.meshes.new(PREFIX + "Plate")
-    s = plate_size / 2
-    t = 0.0015
-    verts = [(x, y, z) for z in (plate_z - t, plate_z) for y in (-s, s) for x in (-s, s)]
-    faces = [(0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1), (2, 3, 7, 6), (0, 2, 6, 4), (1, 5, 7, 3)]
+def _feed(nt, sock, val):
+    """Connect a socket or set a constant."""
+    if isinstance(val, bpy.types.NodeSocket):
+        nt.links.new(val, sock)
+    elif val is not None:
+        sock.default_value = val
+
+
+def _math(nt, op, a=None, b=None, c=None, x=0, y=0, clamp=False):
+    n = _n(nt, "ShaderNodeMath", x, y, operation=op, use_clamp=clamp)
+    _feed(nt, n.inputs[0], a)
+    _feed(nt, n.inputs[1], b)
+    if c is not None:
+        _feed(nt, n.inputs[2], c)
+    return n.outputs[0]
+
+
+def _vmath(nt, op, a=None, b=None, x=0, y=0, scale=None):
+    n = _n(nt, "ShaderNodeVectorMath", x, y, operation=op)
+    _feed(nt, n.inputs[0], a)
+    _feed(nt, n.inputs[1], b)
+    if scale is not None:
+        _feed(nt, n.inputs["Scale"], scale)
+    out = n.outputs["Value"] if op in ("DOT_PRODUCT", "LENGTH", "DISTANCE") else n.outputs["Vector"]
+    return out
+
+
+def _mix(nt, fac, a, b, data_type="RGBA", blend="MIX", x=0, y=0, clamp=True):
+    n = _n(nt, "ShaderNodeMix", x, y, data_type=data_type)
+    if data_type == "RGBA":
+        n.blend_type = blend
+        n.clamp_result = clamp
+        ia, ib, o = n.inputs[6], n.inputs[7], n.outputs[2]
+    elif data_type == "FLOAT":
+        ia, ib, o = n.inputs[2], n.inputs[3], n.outputs[0]
+    else:  # VECTOR
+        ia, ib, o = n.inputs[4], n.inputs[5], n.outputs[1]
+    _feed(nt, n.inputs[0], fac)
+    _feed(nt, ia, a)
+    _feed(nt, ib, b)
+    return o
+
+
+def _maprange(nt, v, a, b, c, d, x=0, y=0, interp="LINEAR", clamp=True):
+    n = _n(nt, "ShaderNodeMapRange", x, y, interpolation_type=interp, clamp=clamp)
+    _feed(nt, n.inputs[0], v)
+    n.inputs[1].default_value = a
+    n.inputs[2].default_value = b
+    n.inputs[3].default_value = c
+    n.inputs[4].default_value = d
+    return n.outputs[0]
+
+
+def _noise(nt, vec, scale, detail=2.0, rough=0.5, dist=0.0, x=0, y=0, dims="3D", w=None, ntype=None):
+    n = _n(nt, "ShaderNodeTexNoise", x, y, noise_dimensions=dims)
+    if ntype:
+        n.noise_type = ntype
+    _feed(nt, n.inputs["Vector"], vec)
+    _feed(nt, n.inputs["Scale"], scale)
+    n.inputs["Detail"].default_value = detail
+    n.inputs["Roughness"].default_value = rough
+    n.inputs["Distortion"].default_value = dist
+    if w is not None:
+        _feed(nt, n.inputs["W"], w)
+    return n
+
+
+def _ramp(nt, fac, stops, interp="LINEAR", x=0, y=0):
+    """stops: list of (pos, (r,g,b,a))"""
+    n = _n(nt, "ShaderNodeValToRGB", x, y)
+    cr = n.color_ramp
+    cr.interpolation = interp
+    while len(cr.elements) > 1:
+        cr.elements.remove(cr.elements[-1])
+    cr.elements[0].position = stops[0][0]
+    cr.elements[0].color = stops[0][1]
+    for p, c in stops[1:]:
+        e = cr.elements.new(p)
+        e.color = c
+    _feed(nt, n.inputs[0], fac)
+    return n.outputs[0]
+
+
+def _new_material(name):
+    m = bpy.data.materials.get(name)
+    if m is None:
+        m = bpy.data.materials.new(name)
+    try:
+        m.use_nodes = True  # deprecated in 5.x but harmless
+    except Exception:
+        pass
+    _clear(m.node_tree)
+    return m
+
+
+def _gray(v):
+    return (v, v, v, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# 1. grain shapes
+# ---------------------------------------------------------------------------
+
+def _gn_new(name):
+    t = bpy.data.node_groups.get(name)
+    if t is None:
+        t = bpy.data.node_groups.new(name, "GeometryNodeTree")
+    else:  # rebuild in place so existing users (modifiers / group nodes) stay linked
+        _clear(t)
+        t.interface.clear()
+    t.interface.new_socket("Instances", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+    return t
+
+
+def _gn_noise_disp(nt, geo, x, y, offset, scale, amp, detail=2.0, rough=0.5):
+    """displace along the radial direction by (noise-0.5)*amp."""
+    pos = _n(nt, "GeometryNodeInputPosition", x, y - 200).outputs[0]
+    p2 = _vmath(nt, "ADD", pos, offset, x + 150, y - 200)
+    nz = _noise(nt, p2, scale, detail, rough, x=x + 300, y=y - 200)
+    d = _math(nt, "SUBTRACT", nz.outputs["Factor"], 0.5, x=x + 450, y=y - 200)
+    d = _math(nt, "MULTIPLY", d, amp, x=x + 600, y=y - 200)
+    nrm = _vmath(nt, "NORMALIZE", pos, None, x + 450, y - 350)
+    off = _vmath(nt, "SCALE", nrm, None, x + 750, y - 300, scale=d)
+    sp = _n(nt, "GeometryNodeSetPosition", x + 900, y)
+    nt.links.new(geo, sp.inputs["Geometry"])
+    nt.links.new(off, sp.inputs["Offset"])
+    return sp.outputs[0]
+
+
+def _gn_clip_plane(nt, geo, normal, d, x, y):
+    """p -= n * max(dot(p,n)-d, 0)   -> flat facet."""
+    pos = _n(nt, "GeometryNodeInputPosition", x, y - 200).outputs[0]
+    dp = _vmath(nt, "DOT_PRODUCT", pos, normal, x + 150, y - 200)
+    e = _math(nt, "SUBTRACT", dp, d, x=x + 300, y=y - 200)
+    e = _math(nt, "MAXIMUM", e, 0.0, x=x + 450, y=y - 200)
+    e = _math(nt, "MULTIPLY", e, -1.0, x=x + 600, y=y - 200)
+    off = _vmath(nt, "SCALE", normal, None, x + 750, y - 200, scale=e)
+    sp = _n(nt, "GeometryNodeSetPosition", x + 900, y)
+    nt.links.new(geo, sp.inputs["Geometry"])
+    nt.links.new(off, sp.inputs["Offset"])
+    return sp.outputs[0]
+
+
+def _rand_unit(rng):
+    while True:
+        v = (rng.uniform(-1, 1), rng.uniform(-1, 1), rng.uniform(-1, 1))
+        l = math.sqrt(sum(c * c for c in v))
+        if 0.2 < l <= 1.0:
+            return tuple(c / l for c in v)
+
+
+def build_grain_shapes(kind="SAND"):
+    """GN group with no inputs, output 'Instances': 8 grain shapes, mean radius ~1."""
+    kind = (kind or "SAND").upper()
+    nt = _gn_new(PREFIX + "GrainShapes_" + kind)
+    rng = random.Random(1234 if kind == "SAND" else 777)
+    # grains carry their material so instancing needs no extra Set Material
+    mat = bpy.data.materials.get(PREFIX + "Grain_" + kind) or make_grain_material(kind)
+    count = 8
+    g2i = _n(nt, "GeometryNodeGeometryToInstance", 4200, 0)
+    out = _n(nt, "NodeGroupOutput", 4450, 0)
+    nt.links.new(g2i.outputs[0], out.inputs[0])
+
+    for i in range(count):
+        y = -i * 900
+        if kind == "SALT":
+            cube = _n(nt, "GeometryNodeMeshCube", 0, y)
+            cube.inputs["Size"].default_value = (1.62, 1.62, 1.62)
+            sub = _n(nt, "GeometryNodeSubdivisionSurface", 200, y)
+            sub.inputs["Level"].default_value = 2
+            sub.inputs["Edge Crease"].default_value = rng.uniform(0.72, 0.86)
+            nt.links.new(cube.outputs[0], sub.inputs[0])
+            geo = sub.outputs[0]
+            # slight warping / uneven faces
+            geo = _gn_noise_disp(nt, geo, 400, y, (rng.uniform(-50, 50),) * 3, 1.4, 0.04, 1.0)
+            # broken corners / chipped edges
+            for k in range(rng.randint(1, 3)):
+                c = [rng.choice((-1, 1)) for _ in range(3)]
+                if rng.random() < 0.5:
+                    c[rng.randrange(3)] = 0.0
+                l = math.sqrt(sum(v * v for v in c))
+                nrm = tuple(v / l + rng.uniform(-0.15, 0.15) for v in c)
+                l = math.sqrt(sum(v * v for v in nrm))
+                nrm = tuple(v / l for v in nrm)
+                geo = _gn_clip_plane(nt, geo, nrm, rng.uniform(0.62, 0.85), 1400 + k * 1100, y)
+            sx = (1.0, rng.uniform(0.82, 1.0), rng.uniform(0.62, 0.95))
+            norm = (sx[0] * sx[1] * sx[2]) ** (-1.0 / 3.0) * 0.98
+        else:
+            ico = _n(nt, "GeometryNodeMeshIcoSphere", 0, y)
+            ico.inputs["Radius"].default_value = 1.0
+            ico.inputs["Subdivisions"].default_value = 3  # 320 tris
+            geo = ico.outputs["Mesh"]
+            o = (rng.uniform(-100, 100), rng.uniform(-100, 100), rng.uniform(-100, 100))
+            # big lumpy form + finer pitting
+            geo = _gn_noise_disp(nt, geo, 200, y, o, rng.uniform(0.7, 1.1), rng.uniform(0.25, 0.42), 1.0, 0.4)
+            geo = _gn_noise_disp(nt, geo, 1200, y, (o[1], o[2], o[0]), 3.2, 0.09, 2.0, 0.55)
+            # sub-angular: 2-4 broken flat facets, rounded by smooth shading
+            nf = rng.randint(3, 6)
+            dmin = 1.0
+            for k in range(nf):
+                d = rng.uniform(0.58, 0.84)
+                dmin = min(dmin, d)
+                geo = _gn_clip_plane(nt, geo, _rand_unit(rng), d, 2200 + k * 1000, y)
+            # conchoidal, not saw-cut: break the planarity of the facets a little
+            geo = _gn_noise_disp(nt, geo, 2200 + nf * 1000, y, (o[2], o[0], o[1]), 2.2, 0.06, 1.0, 0.5)
+            a = rng.uniform(1.0, 1.35)
+            b = rng.uniform(0.85, 1.1)
+            c = rng.uniform(0.6, 0.85)
+            sx = (a, b, c)
+            norm = (a * b * c) ** (-1.0 / 3.0) * 1.16  # compensate volume lost to facets
+        xf = _n(nt, "GeometryNodeTransform", 3700, y)
+        xf.inputs["Scale"].default_value = tuple(s * norm for s in sx)
+        nt.links.new(geo, xf.inputs[0])
+        ss = _n(nt, "GeometryNodeSetShadeSmooth", 3900, y)
+        nt.links.new(xf.outputs[0], ss.inputs[0])
+        sm = _n(nt, "GeometryNodeSetMaterial", 4050, y)
+        sm.inputs["Material"].default_value = mat
+        nt.links.new(ss.outputs[0], sm.inputs[0])
+        nt.links.new(sm.outputs[0], g2i.inputs[0])
+    return nt
+
+
+# ---------------------------------------------------------------------------
+# 2/3. grain + fill materials (shared palette group)
+# ---------------------------------------------------------------------------
+
+def _palette_group(kind):
+    """ShaderNodeTree group: in Tint, Rand  ->  Color, Roughness, SSS, Metallic, Glint."""
+    name = PREFIX + "GrainPalette_" + kind
+    g = bpy.data.node_groups.get(name)
+    if g is not None and getattr(g, "get", None) and g.get("cf_built"):
+        return g  # shared by grain + fill materials: never delete (would orphan users)
+    if g is None:
+        g = bpy.data.node_groups.new(name, "ShaderNodeTree")
+    _clear(g)
+    g.interface.clear()
+    g["cf_built"] = 1
+    it = g.interface
+    it.new_socket("Tint", in_out="INPUT", socket_type="NodeSocketFloat")
+    it.new_socket("Rand", in_out="INPUT", socket_type="NodeSocketFloat")
+    for nm, st in (("Color", "NodeSocketColor"), ("Roughness", "NodeSocketFloat"),
+                   ("SSS", "NodeSocketFloat"), ("Metallic", "NodeSocketFloat"),
+                   ("Glint", "NodeSocketFloat"), ("Clear", "NodeSocketFloat")):
+        it.new_socket(nm, in_out="OUTPUT", socket_type=st)
+    gi = _n(g, "NodeGroupInput", -900, 0)
+    go = _n(g, "NodeGroupOutput", 900, 0)
+    tint, rnd = gi.outputs["Tint"], gi.outputs["Rand"]
+    # decorrelated randoms
+    r2 = _math(g, "FRACT", _math(g, "MULTIPLY", rnd, 7.317, x=-700, y=-300), x=-550, y=-300)
+    r3 = _math(g, "FRACT", _math(g, "MULTIPLY", rnd, 13.71, x=-700, y=-450), x=-550, y=-450)
+
+    if kind == "SALT":
+        col = _ramp(g, tint, [
+            (0.0, (0.80, 0.80, 0.78, 1)),
+            (0.55, (0.86, 0.86, 0.85, 1)),
+            (0.85, (0.78, 0.76, 0.72, 1)),
+            (0.96, (0.62, 0.60, 0.57, 1)),
+        ], "LINEAR", -300, 300)
+        rough = _maprange(g, r2, 0, 1, 0.05, 0.25, -300, 0)
+        sss = _maprange(g, r3, 0, 1, 0.75, 1.0, -300, -150)
+        met = 0.0
+        glint = _math(g, "GREATER_THAN", r2, 0.7, x=-300, y=-300)
+        clear = 0.6
+    else:
+        # mineral classes (constant ramp on tint): fractions of a typical
+        # beach / play sand: mostly quartz (clear, milky, tan, iron-stained),
+        # feldspar (pink/cream), lithic grey and dark heavy minerals.
+        col = _ramp(g, tint, [
+            (0.00, (0.56, 0.51, 0.43, 1)),   # milky quartz
+            (0.20, (0.50, 0.40, 0.27, 1)),   # tan quartz
+            (0.42, (0.60, 0.57, 0.52, 1)),   # clear / frosted quartz
+            (0.55, (0.42, 0.26, 0.13, 1)),   # iron-stained amber
+            (0.66, (0.56, 0.45, 0.32, 1)),   # buff
+            (0.76, (0.31, 0.30, 0.28, 1)),   # lithic grey
+            (0.83, (0.60, 0.40, 0.33, 1)),   # pink feldspar
+            (0.90, (0.68, 0.62, 0.53, 1)),   # cream feldspar
+            (0.95, (0.035, 0.032, 0.03, 1)),  # magnetite / ilmenite
+        ], "CONSTANT", -300, 300)
+        # per-grain value/saturation jitter
+        hsv = _n(g, "ShaderNodeHueSaturation", 0, 300)
+        _feed(g, hsv.inputs["Hue"], _maprange(g, r3, 0, 1, 0.48, 0.52, -150, 450))
+        _feed(g, hsv.inputs["Saturation"], _maprange(g, r2, 0, 1, 0.9, 1.45, -150, 150))
+        _feed(g, hsv.inputs["Value"], _maprange(g, rnd, 0, 1, 0.85, 1.3, -150, 0))
+        g.links.new(col, hsv.inputs["Color"])
+        col = hsv.outputs[0]
+        dark = _math(g, "GREATER_THAN", tint, 0.95, x=-300, y=-600)
+        clear = _math(g, "MULTIPLY",
+                      _math(g, "GREATER_THAN", tint, 0.42, x=-500, y=-750),
+                      _math(g, "LESS_THAN", tint, 0.55, x=-500, y=-850), x=-300, y=-750)
+        rough = _maprange(g, r2, 0, 1, 0.32, 0.6, -300, 0)
+        # clear quartz is glossier, occasional fresh-fracture grain sparkles
+        glint = _math(g, "MAXIMUM", _math(g, "GREATER_THAN", r3, 0.86, x=-300, y=-900), clear, x=-150, y=-900)
+        rough = _mix(g, glint, rough, _maprange(g, r2, 0, 1, 0.06, 0.16, -150, -1050), "FLOAT", x=0, y=0)
+        sss = _mix(g, dark, _maprange(g, r3, 0, 1, 0.2, 0.45, -150, -150), 0.0, "FLOAT", x=0, y=-150)
+        sss = _math(g, "MAXIMUM", sss, _math(g, "MULTIPLY", clear, 0.7, x=0, y=-300), x=150, y=-150)
+        met = _math(g, "MULTIPLY", dark, 0.35, x=0, y=-600)
+    g.links.new(col, go.inputs["Color"])
+    _feed(g, go.inputs["Roughness"], rough)
+    _feed(g, go.inputs["SSS"], sss)
+    _feed(g, go.inputs["Metallic"], met)
+    _feed(g, go.inputs["Glint"], glint)
+    _feed(g, go.inputs["Clear"], clear)
+    return g
+
+
+def _grain_bsdf(nt, pal, x, y, ss_radius_m):
+    b = _n(nt, "ShaderNodeBsdfPrincipled", x, y)
+    b.subsurface_method = "RANDOM_WALK"
+    nt.links.new(pal.outputs["Color"], b.inputs["Base Color"])
+    nt.links.new(pal.outputs["Roughness"], b.inputs["Roughness"])
+    nt.links.new(pal.outputs["Metallic"], b.inputs["Metallic"])
+    nt.links.new(pal.outputs["SSS"], b.inputs["Subsurface Weight"])
+    b.inputs["Subsurface Radius"].default_value = (1.0, 0.75, 0.5)
+    b.inputs["Subsurface Scale"].default_value = ss_radius_m
+    b.inputs["IOR"].default_value = 1.54
+    return b
+
+
+def make_grain_material(kind="SAND"):
+    kind = (kind or "SAND").upper()
+    m = _new_material(PREFIX + "Grain_" + kind)
+    nt = m.node_tree
+    a_t = _n(nt, "ShaderNodeAttribute", -1200, 200, attribute_name="cf_tint", attribute_type="INSTANCER")
+    a_r = _n(nt, "ShaderNodeAttribute", -1200, 0, attribute_name="cf_rand", attribute_type="INSTANCER")
+    pal = _n(nt, "ShaderNodeGroup", -900, 100)
+    pal.node_tree = _palette_group(kind)
+    nt.links.new(a_t.outputs["Factor"], pal.inputs["Tint"])
+    nt.links.new(a_r.outputs["Factor"], pal.inputs["Rand"])
+    b = _grain_bsdf(nt, pal, -300, 200, 0.00018 if kind == "SAND" else 0.0004)
+    # glassy grains (clear quartz / rock salt) partly transmit
+    _feed(nt, b.inputs["Transmission Weight"],
+          _math(nt, "MULTIPLY", pal.outputs["Clear"], 1.0 if kind == "SALT" else 0.55, x=-500, y=500))
+    if kind == "SALT":
+        b.inputs["IOR"].default_value = 1.544
+    # surface micro texture in grain-local space (grain radius == 1 in object space)
+    tc = _n(nt, "ShaderNodeTexCoord", -1200, -300)
+    off = _vmath(nt, "SCALE", _n(nt, "ShaderNodeCombineXYZ", -1050, -450).outputs[0], None, -900, -450,
+                 scale=_math(nt, "MULTIPLY", a_r.outputs["Factor"], 100.0, x=-1050, y=-600))
+    p = _vmath(nt, "ADD", tc.outputs["Object"], off, -750, -300)
+    if kind == "SALT":
+        # stepped / hopper-crystal terraces + frosting
+        nz = _noise(nt, p, 9.0, 3.0, 0.6, x=-600, y=-300)
+        bump_h = nz.outputs["Factor"]
+        strength = 0.3
+    else:
+        nz = _noise(nt, p, 7.0, 4.0, 0.65, x=-600, y=-300)
+        vor = _n(nt, "ShaderNodeTexVoronoi", -600, -550, feature="F1")
+        nt.links.new(p, vor.inputs["Vector"])
+        vor.inputs["Scale"].default_value = 5.0
+        bump_h = _math(nt, "ADD", nz.outputs["Factor"],
+                       _math(nt, "MULTIPLY", vor.outputs["Distance"], 0.35, x=-450, y=-550), x=-300, y=-400)
+        strength = 1.0
+    bump = _n(nt, "ShaderNodeBump", -150, -300)
+    bump.inputs["Strength"].default_value = strength
+    bump.inputs["Distance"].default_value = BUMPD
+    nt.links.new(bump_h, bump.inputs["Height"])
+    nt.links.new(bump.outputs[0], b.inputs["Normal"])
+    # frosted/pitted grains: modulate roughness a little by the micro texture
+    r = _math(nt, "ADD", pal.outputs["Roughness"],
+              _math(nt, "MULTIPLY", _math(nt, "SUBTRACT", nz.outputs["Factor"], 0.5, x=-450, y=-800), 0.25,
+                    x=-300, y=-800), x=-150, y=-700, clamp=True)
+    nt.links.new(r, b.inputs["Roughness"])
+    o = _n(nt, "ShaderNodeOutputMaterial", 200, 200)
+    nt.links.new(b.outputs[0], o.inputs["Surface"])
+    return m
+
+
+def make_fill_material(kind="SAND"):
+    """Heightfield 'body' under the grains: granular at ~0.7 mm, same palette."""
+    kind = (kind or "SAND").upper()
+    m = _new_material(PREFIX + "Fill_" + kind)
+    nt = m.node_tree
+    tc = _n(nt, "ShaderNodeTexCoord", -1400, 0)
+    pos = tc.outputs["Object"]
+    cell = 0.00072 if kind == "SAND" else 0.0010
+    vor = _n(nt, "ShaderNodeTexVoronoi", -1150, 0, feature="F1", voronoi_dimensions="3D")
+    nt.links.new(pos, vor.inputs["Vector"])
+    vor.inputs["Scale"].default_value = 1.0 / cell
+    vor.inputs["Randomness"].default_value = 1.0
+    sep = _n(nt, "ShaderNodeSeparateColor", -950, 0)
+    nt.links.new(vor.outputs["Color"], sep.inputs[0])
+    pal = _n(nt, "ShaderNodeGroup", -750, 0)
+    pal.node_tree = _palette_group(kind)
+    nt.links.new(sep.outputs[0], pal.inputs["Tint"])
+    nt.links.new(sep.outputs[1], pal.inputs["Rand"])
+    # pile thickness -> occlusion (gaps between surface grains look into shadowed depth)
+    ah = _n(nt, "ShaderNodeAttribute", -1150, -400, attribute_name="cf_h", attribute_type="GEOMETRY")
+    occ = _maprange(nt, ah.outputs["Factor"], 0.0, 0.0018, 0.30, 0.62, -950, -400, interp="SMOOTHSTEP")
+    # darken toward cell borders (the crevices between grains)
+    crev = _maprange(nt, vor.outputs["Distance"], 0.15, 0.55, 1.0, 0.45, -950, -250, interp="SMOOTHSTEP")
+    shade = _math(nt, "MULTIPLY", occ, crev, x=-750, y=-300)
+    col = _mix(nt, 1.0, pal.outputs["Color"], shade, "RGBA", "MULTIPLY", -450, 100)
+    b = _n(nt, "ShaderNodeBsdfPrincipled", -150, 100)
+    nt.links.new(col, b.inputs["Base Color"])
+    b.inputs["Roughness"].default_value = 0.6
+    _feed(nt, b.inputs["Subsurface Weight"], _math(nt, "MULTIPLY", pal.outputs["SSS"], 0.4, x=-450, y=-100))
+    b.inputs["Subsurface Scale"].default_value = 0.0003
+    b.inputs["Subsurface Radius"].default_value = (1.0, 0.75, 0.5)
+    # domed grains bump
+    dome = _math(nt, "POWER", _math(nt, "SUBTRACT", 1.0, vor.outputs["Distance"], x=-950, y=-600, clamp=True),
+                 0.5, x=-750, y=-600)
+    bump = _n(nt, "ShaderNodeBump", -450, -500)
+    bump.inputs["Strength"].default_value = 0.8
+    bump.inputs["Distance"].default_value = cell * 0.3
+    nt.links.new(dome, bump.inputs["Height"])
+    nt.links.new(bump.outputs[0], b.inputs["Normal"])
+    o = _n(nt, "ShaderNodeOutputMaterial", 150, 100)
+    nt.links.new(b.outputs[0], o.inputs["Surface"])
+    return m
+
+
+# ---------------------------------------------------------------------------
+# 4. plate material
+# ---------------------------------------------------------------------------
+
+def _scratch_layer(nt, pos, scale, density, seed, x, y, angle_deg=0.0):
+    """Fine straight micro-scratches: very stretched noise, thresholded."""
+    a = math.radians(angle_deg)
+    mp = _n(nt, "ShaderNodeMapping", x, y)
+    mp.inputs["Rotation"].default_value = (0, 0, a)
+    mp.inputs["Location"].default_value = (seed, seed * 0.37, seed * 0.11)
+    mp.inputs["Scale"].default_value = (scale * 0.006, scale, scale)
+    nt.links.new(pos, mp.inputs["Vector"])
+    nz = _noise(nt, mp.outputs[0], 1.0, 1.0, 0.5, x=x + 200, y=y)
+    # thin lines where noise crosses 0.5
+    d = _math(nt, "ABSOLUTE", _math(nt, "SUBTRACT", nz.outputs["Factor"], 0.5, x=x + 350, y=y), x=x + 500, y=y)
+    line = _maprange(nt, d, 0.0, 0.006, 1.0, 0.0, x + 650, y)
+    # sparse: mask with low-freq noise
+    msk = _noise(nt, pos, 18.0, 1.0, 0.5, x=x + 350, y=y - 250, w=None)
+    mk = _maprange(nt, msk.outputs["Factor"], 1.0 - density, 1.0 - density + 0.06, 0.0, 1.0, x + 500, y - 250)
+    return _math(nt, "MULTIPLY", line, mk, x=x + 800, y=y)
+
+
+def make_plate_material(finish="BLACK", plate_size=0.30):
+    finish = (finish or "BLACK").upper()
+    m = _new_material(PREFIX + "Plate_" + finish)
+    nt = m.node_tree
+    tc = _n(nt, "ShaderNodeTexCoord", -2400, 0)
+    pos = tc.outputs["Object"]  # metres, plate centred at origin
+
+    # ---- imperfection masks -------------------------------------------------
+    s1 = _scratch_layer(nt, pos, 900.0, 0.35, 3.1, -2100, 800, 12.0)
+    s2 = _scratch_layer(nt, pos, 1300.0, 0.30, 7.7, -2100, 400, -37.0)
+    s3 = _scratch_layer(nt, pos, 700.0, 0.25, 1.9, -2100, 0, 71.0)
+    scratches = _math(nt, "MAXIMUM", _math(nt, "MAXIMUM", s1, s2, x=-1150, y=600), s3, x=-1000, y=500)
+
+    # fingerprints: a few elliptical patches of concentric distorted ridges
+    fp_total = None
+    k_s = plate_size / 0.30
+    prints = [(-0.105 * k_s, -0.095 * k_s, 0.0, 0.009), (0.112 * k_s, 0.118 * k_s, 1.2, 0.010),
+              (0.118 * k_s, -0.085 * k_s, 2.4, 0.008), (-0.06 * k_s, 0.125 * k_s, 0.6, 0.0085)]
+    for k, (cx, cy, rot, rad) in enumerate(prints):
+        yy = -400 - k * 300
+        mp = _n(nt, "ShaderNodeMapping", -2100, yy)
+        mp.inputs["Location"].default_value = (cx, cy, 0)
+        mp.inputs["Rotation"].default_value = (0, 0, rot)
+        mp.inputs["Scale"].default_value = (1.0, 1.35, 1.0)
+        mp.vector_type = "TEXTURE"
+        nt.links.new(pos, mp.inputs["Vector"])
+        r = _vmath(nt, "LENGTH", _vmath(nt, "MULTIPLY", mp.outputs[0], (1, 1, 0), -1900, yy), None, -1750, yy)
+        blob = _maprange(nt, r, rad * 0.55, rad, 1.0, 0.0, -1600, yy, interp="SMOOTHSTEP")
+        wv = _n(nt, "ShaderNodeTexWave", -1600, yy - 150, wave_type="RINGS", rings_direction="SPHERICAL")
+        nt.links.new(mp.outputs[0], wv.inputs["Vector"])
+        wv.inputs["Scale"].default_value = 700.0  # rings period 2pi/20/scale ~0.45 mm
+        wv.inputs["Distortion"].default_value = 2.5
+        wv.inputs["Detail"].default_value = 1.5
+        wv.inputs["Detail Scale"].default_value = 1.2
+        rid = _maprange(nt, wv.outputs["Factor"], 0.35, 0.75, 0.0, 1.0, -1450, yy - 150)
+        fp = _math(nt, "MULTIPLY", blob, _math(nt, "ADD", rid, 0.35, x=-1300, y=yy - 150), x=-1150, y=yy)
+        fp_total = fp if fp_total is None else _math(nt, "MAXIMUM", fp_total, fp, x=-1000, y=yy)
+    # broad smudges / wipe marks
+    smg = _noise(nt, pos, 9.0, 3.0, 0.6, dist=0.4, x=-1600, y=-1700)
+    smudge = _maprange(nt, smg.outputs["Factor"], 0.58, 0.75, 0.0, 1.0, -1450, -1700)
+    smear = _math(nt, "MAXIMUM", _math(nt, "MULTIPLY", fp_total, 0.8, x=-900, y=-900),
+                  _math(nt, "MULTIPLY", smudge, 0.25, x=-1300, y=-1700), x=-800, y=-1000)
+
+    # dust: sparse tiny specks (voronoi cells, tiny threshold) + fibres
+    vd = _n(nt, "ShaderNodeTexVoronoi", -1600, -2000, feature="F1", voronoi_dimensions="3D")
+    nt.links.new(pos, vd.inputs["Vector"])
+    vd.inputs["Scale"].default_value = 260.0
+    sep = _n(nt, "ShaderNodeSeparateColor", -1450, -2150)
+    nt.links.new(vd.outputs["Color"], sep.inputs[0])
+    speck_r = _math(nt, "MULTIPLY", _math(nt, "POWER", sep.outputs[0], 3.0, x=-1300, y=-2150), 0.1, x=-1150, y=-2150)
+    dust = _math(nt, "LESS_THAN", vd.outputs["Distance"], speck_r, x=-1000, y=-2000)
+    dust = _math(nt, "MULTIPLY", dust, _math(nt, "GREATER_THAN", sep.outputs[1], 0.8, x=-1150, y=-1900),
+                 x=-950, y=-1950)
+    dmask = _noise(nt, pos, 6.0, 2.0, 0.5, x=-1300, y=-2350)
+    dust = _math(nt, "MULTIPLY", dust,
+                 _maprange(nt, dmask.outputs["Factor"], 0.4, 0.6, 0.25, 1.0, -1150, -2350), x=-850, y=-2050)
+
+    # edge wear: distance to plate rim (square, 0.15 half-size) + chamfer normals
+    ab = _vmath(nt, "ABSOLUTE", pos, None, -2100, -2600)
+    sxyz = _n(nt, "ShaderNodeSeparateXYZ", -1950, -2600)
+    nt.links.new(ab, sxyz.inputs[0])
+    edge_d = _math(nt, "SUBTRACT", plate_size / 2, _math(nt, "MAXIMUM", sxyz.outputs[0], sxyz.outputs[1], x=-1800, y=-2600),
+                   x=-1650, y=-2600)
+    geo = _n(nt, "ShaderNodeNewGeometry", -2100, -2850)
+    sepn = _n(nt, "ShaderNodeSeparateXYZ", -1950, -2850)
+    nt.links.new(geo.outputs["Normal"], sepn.inputs[0])
+    side = _maprange(nt, _math(nt, "ABSOLUTE", sepn.outputs[2], x=-1800, y=-2850), 0.95, 0.75, 0.0, 1.0, -1650, -2850)
+    ewn = _noise(nt, pos, 900.0, 3.0, 0.7, x=-1650, y=-3050)
+    rim = _maprange(nt, edge_d, 0.0, 0.0012, 1.0, 0.0, -1500, -2600)
+    edgewear = _math(nt, "MAXIMUM", rim, side, x=-1350, y=-2700)
+    edgewear = _math(nt, "MULTIPLY", edgewear,
+                     _maprange(nt, ewn.outputs["Factor"], 0.42, 0.6, 0.0, 1.0, -1500, -3050), x=-1200, y=-2800)
+    # large-scale roughness variation (handling, uneven anodize)
+    big = _noise(nt, pos, 4.0, 3.0, 0.55, x=-1600, y=1200)
+    bigv = _math(nt, "SUBTRACT", big.outputs["Factor"], 0.5, x=-1450, y=1200)
+
+    b = _n(nt, "ShaderNodeBsdfPrincipled", 200, 200)
+    if finish == "ALUMINUM":
+        base = (0.80, 0.81, 0.82, 1)
+        r0, r_scr, r_smear = 0.22, 0.12, 0.06
+        b.inputs["Metallic"].default_value = 1.0
+        # brushed along X: anisotropy + streaky roughness
+        mp = _n(nt, "ShaderNodeMapping", -1600, 1500)
+        mp.inputs["Scale"].default_value = (2.0, 2500.0, 40.0)
+        nt.links.new(pos, mp.inputs["Vector"])
+        br = _noise(nt, mp.outputs[0], 1.0, 4.0, 0.6, x=-1450, y=1500)
+        brush = br.outputs["Factor"]
+        b.inputs["Anisotropic"].default_value = 0.75
+        # brushing runs along object X; plate is never rotated so a constant world tangent works
+        tg = _n(nt, "ShaderNodeCombineXYZ", -100, -400)
+        tg.inputs[0].default_value = 1.0
+        nt.links.new(tg.outputs[0], b.inputs["Tangent"])
+        wear_col = (0.9, 0.9, 0.9, 1)
+    elif finish == "BRASS":
+        base = (0.80, 0.58, 0.28, 1)
+        r0, r_scr, r_smear = 0.24, 0.12, 0.12
+        b.inputs["Metallic"].default_value = 1.0
+        brush = None
+        wear_col = (0.95, 0.78, 0.45, 1)
+    else:  # BLACK anodized
+        base = (0.011, 0.011, 0.012, 1)
+        r0, r_scr, r_smear = 0.20, 0.16, 0.14
+        b.inputs["Metallic"].default_value = 0.0
+        b.inputs["Specular IOR Level"].default_value = 0.5
+        brush = None
+        wear_col = (0.55, 0.56, 0.57, 1)  # bare aluminium
+
+    # base colour
+    col = _n(nt, "ShaderNodeRGB", -800, 1300)
+    col.outputs[0].default_value = base
+    colv = col.outputs[0]
+    if finish == "BRASS":
+        tarn = _noise(nt, pos, 14.0, 4.0, 0.6, dist=0.3, x=-800, y=1100)
+        tmask = _maprange(nt, tarn.outputs["Factor"], 0.45, 0.7, 0.0, 0.55, -650, 1100)
+        colv = _mix(nt, tmask, colv, (0.42, 0.30, 0.16, 1), x=-500, y=1200)
+    elif finish == "BLACK":
+        # faint dye unevenness
+        colv = _mix(nt, _math(nt, "MULTIPLY", big.outputs["Factor"], 0.5, x=-800, y=1100), colv,
+                    (0.026, 0.025, 0.028, 1), x=-500, y=1200)
+    colv = _mix(nt, _math(nt, "MULTIPLY", dust, 0.85, x=-500, y=-2000), colv, (0.42, 0.40, 0.37, 1), x=-300, y=1200)
+    colv = _mix(nt, edgewear, colv, wear_col, x=-150, y=1200)
+    nt.links.new(colv, b.inputs["Base Color"])
+    if finish == "BLACK":
+        _feed(nt, b.inputs["Metallic"], edgewear)
+
+    # roughness
+    rough = _math(nt, "ADD", r0, _math(nt, "MULTIPLY", bigv, 0.05, x=-1300, y=1200), x=-1150, y=1100)
+    if brush is not None:
+        rough = _math(nt, "ADD", rough, _math(nt, "MULTIPLY", _math(nt, "SUBTRACT", brush, 0.5, x=-1300, y=1500),
+                                                0.18, x=-1150, y=1500), x=-1000, y=1300)
+    rough = _math(nt, "ADD", rough, _math(nt, "MULTIPLY", scratches, r_scr, x=-850, y=600), x=-700, y=900)
+    rough = _math(nt, "ADD", rough, _math(nt, "MULTIPLY", smear, r_smear, x=-700, y=-900), x=-550, y=800)
+    rough = _math(nt, "ADD", rough, _math(nt, "MULTIPLY", dust, 0.5, x=-550, y=-2000), x=-400, y=700, clamp=True)
+    nt.links.new(rough, b.inputs["Roughness"])
+
+    # normal: scratches cut in, fingerprint ridges, powder/orange-peel micro relief
+    op = _noise(nt, pos, 2200.0, 2.0, 0.5, x=-800, y=-200)
+    h = _math(nt, "ADD", _math(nt, "MULTIPLY", op.outputs["Factor"], 0.15, x=-650, y=-200),
+              _math(nt, "MULTIPLY", scratches, -0.6, x=-650, y=-350), x=-500, y=-250)
+    h = _math(nt, "ADD", h, _math(nt, "MULTIPLY", fp_total, 0.25, x=-650, y=-500), x=-350, y=-300)
+    if brush is not None:
+        h = _math(nt, "ADD", h, _math(nt, "MULTIPLY", brush, 0.4, x=-500, y=-450), x=-250, y=-350)
+    bump = _n(nt, "ShaderNodeBump", -100, -250)
+    bump.inputs["Strength"].default_value = 0.35
+    bump.inputs["Distance"].default_value = 0.00002
+    nt.links.new(h, bump.inputs["Height"])
+    nt.links.new(bump.outputs[0], b.inputs["Normal"])
+    if finish == "BLACK":
+        # thin hard sealing coat with faint smear
+        b.inputs["Coat Weight"].default_value = 0.0
+    o = _n(nt, "ShaderNodeOutputMaterial", 500, 200)
+    nt.links.new(b.outputs[0], o.inputs["Surface"])
+    return m
+
+
+# ---------------------------------------------------------------------------
+# 5. studio
+# ---------------------------------------------------------------------------
+
+def _obj(name, data, collection):
+    o = bpy.data.objects.new(name, data)
+    collection.objects.link(o)
+    return o
+
+
+def _mesh(name, verts, faces):
+    me = bpy.data.meshes.new(name)
     me.from_pydata(verts, [], faces)
-    ob = bpy.data.objects.new(PREFIX + "Plate", me)
-    collection.objects.link(ob)
-    me.materials.append(make_plate_material(finish))
-    return {"plate": ob}
+    me.update()
+    return me
+
+
+def _box_mesh(name, sx, sy, sz, z0=0.0):
+    x, y = sx / 2, sy / 2
+    v = [(-x, -y, z0), (x, -y, z0), (x, y, z0), (-x, y, z0),
+         (-x, -y, z0 + sz), (x, -y, z0 + sz), (x, y, z0 + sz), (-x, y, z0 + sz)]
+    f = [(0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]
+    return _mesh(name, v, f)
+
+
+def _cyl_mesh(name, r, h, n=48, z0=0.0, r_top=None):
+    r_top = r if r_top is None else r_top
+    v, f = [], []
+    for i in range(n):
+        a = 2 * math.pi * i / n
+        v.append((r * math.cos(a), r * math.sin(a), z0))
+    for i in range(n):
+        a = 2 * math.pi * i / n
+        v.append((r_top * math.cos(a), r_top * math.sin(a), z0 + h))
+    for i in range(n):
+        j = (i + 1) % n
+        f.append((i, j, n + j, n + i))
+    f.append(tuple(reversed(range(n))))
+    f.append(tuple(range(n, 2 * n)))
+    return _mesh(name, v, f)
+
+
+def _bevel(o, width, segs=3, limit="ANGLE"):
+    md = o.modifiers.new("CF_Bevel", "BEVEL")
+    md.width = width
+    md.segments = segs
+    md.limit_method = limit
+    md.harden_normals = False
+    return md
+
+
+def _simple_mat(name, color, rough, metallic=0.0, spec=0.5, coat=0.0, bump_scale=None, bump_str=0.0,
+                sheen=0.0):
+    m = _new_material(name)
+    nt = m.node_tree
+    b = _n(nt, "ShaderNodeBsdfPrincipled", 0, 0)
+    b.inputs["Base Color"].default_value = color
+    b.inputs["Roughness"].default_value = rough
+    b.inputs["Metallic"].default_value = metallic
+    b.inputs["Specular IOR Level"].default_value = spec
+    b.inputs["Coat Weight"].default_value = coat
+    b.inputs["Sheen Weight"].default_value = sheen
+    if bump_scale:
+        tc = _n(nt, "ShaderNodeTexCoord", -800, -200)
+        nz = _noise(nt, tc.outputs["Object"], bump_scale, 4.0, 0.6, x=-600, y=-200)
+        bp = _n(nt, "ShaderNodeBump", -300, -200)
+        bp.inputs["Strength"].default_value = bump_str
+        bp.inputs["Distance"].default_value = 0.0002
+        nt.links.new(nz.outputs["Factor"], bp.inputs["Height"])
+        nt.links.new(bp.outputs[0], b.inputs["Normal"])
+        rr = _math(nt, "ADD", rough, _math(nt, "MULTIPLY", _math(nt, "SUBTRACT", nz.outputs["Factor"], 0.5, x=-450, y=0),
+                                            0.15, x=-300, y=0), x=-150, y=100, clamp=True)
+        nt.links.new(rr, b.inputs["Roughness"])
+    o = _n(nt, "ShaderNodeOutputMaterial", 300, 0)
+    nt.links.new(b.outputs[0], o.inputs["Surface"])
+    return m
+
+
+def _backdrop_material():
+    """Seamless matte paper, charcoal grey with paper fibre + faint unevenness."""
+    m = _new_material(PREFIX + "Backdrop")
+    nt = m.node_tree
+    tc = _n(nt, "ShaderNodeTexCoord", -1200, 0)
+    p = tc.outputs["Object"]
+    big = _noise(nt, p, 1.5, 3.0, 0.5, x=-900, y=200)
+    fib = _noise(nt, p, 900.0, 3.0, 0.7, x=-900, y=-100)
+    v = _maprange(nt, big.outputs["Factor"], 0.3, 0.7, 0.92, 1.06, -700, 200)
+    col = _mix(nt, 1.0, (0.028, 0.028, 0.029, 1), v, "RGBA", "MULTIPLY", -500, 200)
+    col = _mix(nt, _math(nt, "MULTIPLY", fib.outputs["Factor"], 0.15, x=-700, y=-100), col,
+               (0.036, 0.035, 0.034, 1), x=-350, y=150)
+    b = _n(nt, "ShaderNodeBsdfPrincipled", 0, 0)
+    nt.links.new(col, b.inputs["Base Color"])
+    b.inputs["Roughness"].default_value = 0.85
+    b.inputs["Specular IOR Level"].default_value = 0.25
+    b.inputs["Sheen Weight"].default_value = 0.0
+    bp = _n(nt, "ShaderNodeBump", -300, -200)
+    bp.inputs["Strength"].default_value = 0.15
+    bp.inputs["Distance"].default_value = 0.0002
+    nt.links.new(fib.outputs["Factor"], bp.inputs["Height"])
+    nt.links.new(bp.outputs[0], b.inputs["Normal"])
+    o = _n(nt, "ShaderNodeOutputMaterial", 300, 0)
+    nt.links.new(b.outputs[0], o.inputs["Surface"])
+    return m
+
+
+def _sweep_mesh(name, width=3.0, front=-1.6, flat_to=0.55, radius=0.6, top=1.6, nseg=24):
+    """Seamless paper sweep: floor (z=0) from y=front to y=flat_to, curving up into a back wall."""
+    prof = [(front, 0.0)]
+    steps = 12
+    for i in range(1, steps + 1):
+        prof.append((front + (flat_to - front) * i / steps, 0.0))
+    for i in range(1, nseg + 1):
+        a = (math.pi / 2) * i / nseg
+        prof.append((flat_to + radius * math.sin(a), radius * (1 - math.cos(a))))
+    prof.append((flat_to + radius, top))
+    xs = [-width / 2 + width * i / 8 for i in range(9)]
+    verts = []
+    for x in xs:
+        for (y, z) in prof:
+            verts.append((x, y, z))
+    n = len(prof)
+    faces = []
+    for i in range(len(xs) - 1):
+        for j in range(n - 1):
+            a = i * n + j
+            faces.append((a, a + 1, a + n + 1, a + n))
+    me = _mesh(name, verts, faces)
+    for p in me.polygons:
+        p.use_smooth = True
+    return me
+
+
+def _area(name, collection, loc, target, power, size, size_y=None, shape="RECTANGLE", spread=180.0,
+          temp=None, color=(1, 1, 1)):
+    ld = bpy.data.lights.new(name, "AREA")
+    ld.energy = power
+    ld.shape = shape
+    ld.size = size
+    if size_y is not None:
+        ld.size_y = size_y
+    ld.spread = math.radians(spread)
+    ld.color = color
+    if temp is not None and hasattr(ld, "use_temperature"):
+        ld.use_temperature = True
+        ld.temperature = temp
+    o = _obj(name, ld, collection)
+    o.location = loc
+    _aim(o, target)
+    return o
+
+
+def _aim(o, target):
+    from mathutils import Vector
+    d = Vector(target) - Vector(o.location)
+    o.rotation_euler = d.to_track_quat("-Z", "Y").to_euler()
+
+
+def _reflection_card(collection, loc, target, sx, sy, strength):
+    """Emissive card seen only by glossy rays: gives the black plate a soft specular
+    gradient (the classic product-shot 'strip in the reflection') without lighting the set."""
+    hx, hy = sx / 2, sy / 2
+    me = _mesh(PREFIX + "ReflectionCardMesh", [(-hx, -hy, 0), (hx, -hy, 0), (hx, hy, 0), (-hx, hy, 0)],
+               [(0, 1, 2, 3)])
+    o = _obj(PREFIX + "ReflectionCard", me, collection)
+    o.location = loc
+    _aim(o, target)
+    m = _new_material(PREFIX + "ReflectionCard")
+    nt = m.node_tree
+    tc = _n(nt, "ShaderNodeTexCoord", -800, 0)
+    sep = _n(nt, "ShaderNodeSeparateXYZ", -600, 0)
+    nt.links.new(tc.outputs["Generated"], sep.inputs[0])
+    # soft falloff on all borders, brighter towards the top edge
+    gx = _math(nt, "SINE", _math(nt, "MULTIPLY", sep.outputs[0], math.pi, x=-450, y=100), x=-300, y=100)
+    gy = _maprange(nt, sep.outputs[1], 0.0, 1.0, 0.15, 1.0, -450, -100, interp="SMOOTHSTEP")
+    gy2 = _math(nt, "SINE", _math(nt, "MULTIPLY", sep.outputs[1], math.pi, x=-450, y=-250), x=-300, y=-250)
+    f = _math(nt, "MULTIPLY", _math(nt, "MULTIPLY", gx, gy, x=-150, y=0), gy2, x=0, y=0)
+    f = _math(nt, "POWER", f, 0.7, x=150, y=0)
+    em = _n(nt, "ShaderNodeEmission", 300, 0)
+    em.inputs["Color"].default_value = (1.0, 0.98, 0.96, 1)
+    _feed(nt, em.inputs["Strength"], _math(nt, "MULTIPLY", f, strength, x=300, y=-150))
+    out = _n(nt, "ShaderNodeOutputMaterial", 500, 0)
+    nt.links.new(em.outputs[0], out.inputs["Surface"])
+    me.materials.append(m)
+    o.visible_camera = False
+    o.visible_diffuse = False
+    o.visible_shadow = False
+    o.visible_transmission = False
+    o.visible_volume_scatter = False
+    o.visible_glossy = True
+    return o
+
+
+def _world(scene):
+    w = bpy.data.worlds.get(PREFIX + "World") or bpy.data.worlds.new(PREFIX + "World")
+    try:
+        w.use_nodes = True
+    except Exception:
+        pass
+    nt = w.node_tree
+    _clear(nt)
+    # dim studio: soft overhead gradient, very dark below -> natural falloff in reflections
+    tc = _n(nt, "ShaderNodeTexCoord", -900, 0)
+    sep = _n(nt, "ShaderNodeSeparateXYZ", -700, 0)
+    nt.links.new(tc.outputs["Generated"], sep.inputs[0])
+    grad = _maprange(nt, sep.outputs[2], -0.2, 0.8, 0.0, 1.0, -500, 0, interp="SMOOTHSTEP")
+    col = _mix(nt, grad, (0.004, 0.004, 0.0045, 1), (0.03, 0.03, 0.032, 1), x=-300, y=0)
+    bg = _n(nt, "ShaderNodeBackground", 0, 0)
+    nt.links.new(col, bg.inputs["Color"])
+    bg.inputs["Strength"].default_value = 1.0
+    o = _n(nt, "ShaderNodeOutputWorld", 200, 0)
+    nt.links.new(bg.outputs[0], o.inputs["Surface"])
+    scene.world = w
+    return w
+
+
+def _render_settings(scene):
+    scene.render.engine = "CYCLES"
+    c = scene.cycles
+    c.samples = 128
+    c.preview_samples = 32
+    c.use_adaptive_sampling = True
+    c.adaptive_threshold = 0.015
+    c.use_denoising = True
+    try:
+        c.denoiser = "OPENIMAGEDENOISE"
+        c.denoising_input_passes = "RGB_ALBEDO_NORMAL"
+        c.denoising_prefilter = "ACCURATE"
+    except Exception:
+        pass
+    c.max_bounces = 12
+    c.diffuse_bounces = 3
+    c.glossy_bounces = 4
+    c.transmission_bounces = 8
+    c.transparent_max_bounces = 8
+    c.volume_bounces = 0
+    c.sample_clamp_direct = 0.0
+    c.sample_clamp_indirect = 4.0
+    c.blur_glossy = 0.5
+    c.caustics_reflective = False
+    c.caustics_refractive = False
+    c.use_light_tree = True
+    try:
+        c.pixel_filter_type = "BLACKMAN_HARRIS"
+        c.filter_width = 1.5
+    except Exception:
+        pass
+    r = scene.render
+    r.resolution_x, r.resolution_y = 1920, 1080
+    r.resolution_percentage = 100
+    r.film_transparent = False
+    vs = scene.view_settings
+    vs.view_transform = "AgX"
+    try:
+        vs.look = "AgX - Medium High Contrast"
+    except Exception:
+        pass
+    vs.exposure = 0.0
+    vs.gamma = 1.0
+    scene.display_settings.display_device = "sRGB"
+    try:
+        scene.sequencer_colorspace_settings.name = "sRGB"
+    except Exception:
+        pass
+
+
+def _compositor(scene, vignette=0.22, grain=0.035, dispersion=0.004):
+    """Photographic finishing: faint lateral CA, lens vignette, fine luminance grain.
+    Best effort -- silently skipped if the compositor API differs."""
+    try:
+        name = PREFIX + "PhotoFinish"
+        t = bpy.data.node_groups.get(name)
+        if t is None:
+            t = bpy.data.node_groups.new(name, "CompositorNodeTree")
+        _clear(t)
+        t.interface.clear()
+        t.interface.new_socket("Image", in_out="OUTPUT", socket_type="NodeSocketColor")
+        rl = _n(t, "CompositorNodeRLayers", -900, 0)
+        ld = _n(t, "CompositorNodeLensdist", -650, 0)
+        t.links.new(rl.outputs["Image"], ld.inputs["Image"])
+        ld.inputs["Dispersion"].default_value = dispersion
+        img = ld.outputs["Image"]
+        ic = _n(t, "CompositorNodeImageCoordinates", -650, -300)
+        t.links.new(img, ic.inputs["Image"])
+        # vignette: cos^4-like falloff from frame centre
+        r = _vmath(t, "LENGTH", ic.outputs["Normalized"], None, -450, -300)
+        vig = _maprange(t, r, 0.45, 1.45, 1.0, 1.0 - vignette, -300, -300, interp="SMOOTHSTEP")
+        # grain: per-pixel noise, multiplicative (stronger in mid/low tones like film/sensor)
+        nz = _noise(t, ic.outputs["Pixel"], 0.9, 0.0, 0.5, x=-450, y=-550)
+        g = _math(t, "MULTIPLY", _math(t, "SUBTRACT", nz.outputs["Factor"], 0.5, x=-300, y=-550), grain * 2.0,
+                  x=-150, y=-550)
+        f = _math(t, "MULTIPLY", vig, _math(t, "ADD", g, 1.0, x=0, y=-550), x=150, y=-400)
+        mx = _mix(t, 1.0, img, f, "RGBA", "MULTIPLY", 300, 0, clamp=False)
+        go = _n(t, "NodeGroupOutput", 500, 0)
+        t.links.new(mx, go.inputs[0])
+        scene.compositing_node_group = t
+        scene.render.use_compositing = True
+        # GPU compositor needs an EGL/GL context; headless/background Blender crashes
+        # without one. These 3 nodes are trivial on CPU.
+        try:
+            scene.render.compositor_device = "CPU"
+        except Exception:
+            pass
+        return t
+    except Exception as e:  # pragma: no cover
+        print("cf_look: compositor finishing skipped:", e)
+        return None
+
+
+def _plate_mesh(name, size, thick, z_top, hole_r=0.0042):
+    """Square slab, top at z_top. 8x8 quads on faces keeps bevel/shading clean."""
+    h = size / 2
+    me = _box_mesh(name, size, size, thick, z_top - thick)
+    return me
+
+
+def _cable(name, collection, pts, radius, mat):
+    cu = bpy.data.curves.new(name, "CURVE")
+    cu.dimensions = "3D"
+    cu.bevel_depth = radius
+    cu.bevel_resolution = 4
+    cu.resolution_u = 16
+    sp = cu.splines.new("BEZIER")
+    sp.bezier_points.add(len(pts) - 1)
+    for bp, p in zip(sp.bezier_points, pts):
+        bp.co = p
+        bp.handle_left_type = bp.handle_right_type = "AUTO"
+    o = _obj(name, cu, collection)
+    cu.materials.append(mat)
+    return o
+
+
+def build_studio(scene, plate_size=0.30, plate_z=0.14, finish="BLACK", collection=None,
+                 full=True):
+    if collection is None:
+        collection = scene.collection
+    finish = (finish or "BLACK").upper()
+    out = {}
+    s = plate_size
+    thick = 0.0015
+
+    # ---- plate --------------------------------------------------------------
+    pm = make_plate_material(finish, plate_size)
+    plate = _obj(PREFIX + "Plate", _plate_mesh(PREFIX + "PlateMesh", s, thick, plate_z), collection)
+    bv = _bevel(plate, 0.00045, 3)
+    bv.harden_normals = True
+    for p in plate.data.polygons:
+        p.use_smooth = True
+    plate.data.materials.append(pm)
+    out["plate"] = plate
+
+    # ---- centre bolt + washer + knurled nut on top ---------------------------
+    metal = _simple_mat(PREFIX + "Steel", (0.62, 0.62, 0.62, 1), 0.28, metallic=1.0, bump_scale=3000.0, bump_str=0.2)
+    washer = _obj(PREFIX + "Washer", _cyl_mesh(PREFIX + "WasherMesh", 0.0095, 0.0012, 64, plate_z), collection)
+    _bevel(washer, 0.0003, 2)
+    washer.data.materials.append(metal)
+    nut = _obj(PREFIX + "Nut", _cyl_mesh(PREFIX + "NutMesh", 0.0072, 0.0055, 6, plate_z + 0.0012), collection)
+    nut.rotation_euler[2] = math.radians(15)
+    _bevel(nut, 0.0004, 2)
+    nut.data.materials.append(metal)
+    stud = _obj(PREFIX + "Stud", _cyl_mesh(PREFIX + "StudMesh", 0.0029, 0.0082, 32, plate_z + 0.0012), collection)
+    _bevel(stud, 0.0004, 2)
+    stud.data.materials.append(metal)
+    for o in (washer, stud):
+        for p in o.data.polygons:
+            p.use_smooth = True
+        o.data.set_sharp_from_angle(angle=math.radians(40))
+    out["washer"], out["nut"], out["stud"] = washer, nut, stud
+
+    # ---- wave driver below ---------------------------------------------------
+    housing_mat = _simple_mat(PREFIX + "DriverBody", (0.025, 0.026, 0.028, 1), 0.42, bump_scale=1500.0,
+                              bump_str=0.25, coat=0.0)
+    trim_mat = _simple_mat(PREFIX + "DriverTrim", (0.20, 0.20, 0.21, 1), 0.35, metallic=1.0)
+    rubber = _simple_mat(PREFIX + "Rubber", (0.006, 0.006, 0.006, 1), 0.55, sheen=0.05)
+    hz0, hh = 0.008, max(plate_z - 0.06, 0.03)
+    body = _obj(PREFIX + "DriverHousing", _cyl_mesh(PREFIX + "DriverMesh", 0.068, hh, 96, hz0), collection)
+    _bevel(body, 0.006, 5)
+    for p in body.data.polygons:
+        p.use_smooth = True
+    body.data.set_sharp_from_angle(angle=math.radians(50))
+    body.data.materials.append(housing_mat)
+    ring = _obj(PREFIX + "DriverCap", _cyl_mesh(PREFIX + "DriverCapMesh", 0.03, 0.004, 64, hz0 + hh), collection)
+    _bevel(ring, 0.0012, 3)
+    ring.data.materials.append(trim_mat)
+    for p in ring.data.polygons:
+        p.use_smooth = True
+    ring.data.set_sharp_from_angle(angle=math.radians(50))
+    shaft_z0 = hz0 + hh + 0.004
+    shaft = _obj(PREFIX + "DriverShaft",
+                 _cyl_mesh(PREFIX + "ShaftMesh", 0.0042, plate_z - thick - shaft_z0, 32, shaft_z0), collection)
+    shaft.data.materials.append(metal)
+    for p in shaft.data.polygons:
+        p.use_smooth = True
+    shaft.data.set_sharp_from_angle(angle=math.radians(40))
+    # under-plate nut
+    unut = _obj(PREFIX + "UnderNut", _cyl_mesh(PREFIX + "UnderNutMesh", 0.0065, 0.004, 6, plate_z - thick - 0.004),
+                collection)
+    _bevel(unut, 0.0004, 2)
+    unut.data.materials.append(metal)
+    feet = []
+    for k in range(3):
+        a = 2 * math.pi * k / 3 + 0.5
+        f = _obj(PREFIX + "Foot%d" % k, _cyl_mesh(PREFIX + "FootMesh%d" % k, 0.011, hz0, 32, 0.0, 0.010),
+                 collection)
+        f.location = (0.05 * math.cos(a), 0.05 * math.sin(a), 0)
+        f.data.materials.append(rubber)
+        _bevel(f, 0.002, 3)
+        for p in f.data.polygons:
+            p.use_smooth = True
+        feet.append(f)
+    cable = _cable(PREFIX + "Cable", collection,
+                   [(0.06, 0.03, 0.03), (0.11, 0.07, 0.004), (0.25, 0.20, 0.0035), (0.55, 0.30, 0.0035),
+                    (0.9, 0.55, 0.0035)], 0.0035, rubber)
+    out.update(driver=body, driver_cap=ring, shaft=shaft, cable=cable)
+
+    if not full:
+        # apparatus only: keep the user's own camera, lights, world, settings
+        return out
+
+    # ---- backdrop sweep ------------------------------------------------------
+    bd = _obj(PREFIX + "Backdrop", _sweep_mesh(PREFIX + "BackdropMesh"), collection)
+    bd.data.materials.append(_backdrop_material())
+    out["backdrop"] = bd
+
+    # ---- lights --------------------------------------------------------------
+    c = (0, 0, plate_z)
+    # key: large softbox, front-left, high
+    key = _area(PREFIX + "Key", collection, (-0.95, -0.85, 1.05), (0, 0.02, plate_z), 9.0, 0.6, 0.45,
+                spread=60.0, temp=5600)
+    # rim / kicker: long strip, back-right, low -> rakes across the ridges
+    rim = _area(PREFIX + "Rim", collection, (0.85, 0.80, plate_z + 0.13), (0, 0, plate_z), 11.0, 0.9, 0.10,
+                spread=40.0, temp=5600)
+    # fill: broad dim card near camera axis, right
+    fill = _area(PREFIX + "Fill", collection, (0.9, -1.1, 0.55), c, 0.8, 1.2, 1.2, spread=180.0, temp=5800)
+    # top bounce for a soft gradient reflection on the plate
+    # reflector: big soft panel placed in the mirror direction of the hero camera so the
+    # black plate carries a soft specular gradient (product-shot look)
+    top = _area(PREFIX + "Top", collection, (-0.55, 1.10, 1.25), c, 2.0, 1.6, 0.5, spread=180.0, temp=5600)
+    card = _reflection_card(collection, (-0.42, 0.80, 0.80), (0, 0, plate_z), 1.4, 0.32,
+                            1.4 if finish == "BLACK" else 0.45)
+    out.update(key_light=key, rim_light=rim, fill_light=fill, top_light=top, reflection_card=card)
+    _world(scene)
+
+    # ---- cameras -------------------------------------------------------------
+    focus = bpy.data.objects.new(PREFIX + "Focus", None)
+    collection.objects.link(focus)
+    focus.location = (0.0, -0.03, plate_z)
+    out["focus"] = focus
+
+    def mk_cam(name, lens, loc, target, fstop, dof=True, focus_obj=None):
+        cd = bpy.data.cameras.new(name)
+        cd.lens = lens
+        cd.sensor_width = 36.0
+        cd.sensor_fit = "HORIZONTAL"
+        cd.clip_start = 0.01
+        cd.clip_end = 50.0
+        cd.dof.use_dof = dof
+        cd.dof.aperture_fstop = fstop
+        cd.dof.aperture_blades = 9
+        cd.dof.aperture_rotation = math.radians(10)
+        o = _obj(name, cd, collection)
+        o.location = loc
+        _aim(o, target)
+        if focus_obj is not None:
+            cd.dof.focus_object = focus_obj
+        else:
+            from mathutils import Vector
+            cd.dof.focus_distance = (Vector(target) - Vector(loc)).length
+        return o
+
+    # hero: 90 mm, ~33 deg elevation, 3/4 from front-left
+    el, az, dist = math.radians(33.0), math.radians(-62.0), 1.45
+    hero_loc = (dist * math.cos(el) * math.cos(az), dist * math.cos(el) * math.sin(az),
+                plate_z + dist * math.sin(el))
+    cam = mk_cam(PREFIX + "Camera", 90.0, hero_loc, (0.0, 0.0, plate_z - 0.035), 7.1, True, focus)
+    top_cam = mk_cam(PREFIX + "CameraTop", 85.0, (0.0, 0.0, plate_z + 1.55), (0.0, 0.0, plate_z), 11.0, True)
+    # macro: 100 mm macro lens close on a ridge
+    mel, maz, md = math.radians(28.0), math.radians(-70.0), 0.36
+    macro_t = (0.02, -0.03, plate_z)
+    mloc = (macro_t[0] + md * math.cos(mel) * math.cos(maz), macro_t[1] + md * math.cos(mel) * math.sin(maz),
+            plate_z + md * math.sin(mel))
+    macro = mk_cam(PREFIX + "CameraMacro", 100.0, mloc, macro_t, 11.0, True)
+    scene.camera = cam
+    out.update(camera=cam, camera_top=top_cam, camera_macro=macro)
+
+    _render_settings(scene)
+    out["compositor"] = _compositor(scene)
+    return out
 
 
 # ======================================================================
