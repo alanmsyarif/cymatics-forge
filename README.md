@@ -35,6 +35,18 @@ Everything is procedural: there are no image textures or HDRIs.
 
 Every physical and audio setting (Drive, Bass Punch, Ring Down, Hop Height, Angle of Repose, Substeps, …) is a live modifier input. Tweak these settings without rebuilding.
 
-![description](./images/cymage.png)
+## Renders
+All four images are straight Cycles renders of the add-on's default build (no paint-over). Each frame is at 1920×1080 and 128 samples, with a 450k-grain simulation driven by a test track.
 
-![description](./images/cymage2.png)
+Settled pattern: sand has collected on the nodal lines, and a few grains are stuck in between.
+![Settled hero](./images/hero_settled.jpg)
+![Settled macro](./images/macro_settled.jpg)
+
+The moment the music changes pitch: the plate jumps to a new resonance, sand leaps off the new antinodes, and some pours over the edges onto the table.
+![Jump hero](./images/hero_jump.jpg)
+![Jump macro](./images/macro_jump.jpg)
+
+## Performance
+- **Simulation:** about 0.1 s per frame per 100k grains, measured on 4 CPU cores. Bake before rendering.
+- **Rendering:** a 1080p hero frame is about a minute on a desktop GPU. Instanced grains share 8 meshes, so memory stays low.
+- **Viewport:** if playback is too slow, lower *Grain Count* or *Substeps* in the modifier. Changing *Grain Count* takes effect from the first frame.
