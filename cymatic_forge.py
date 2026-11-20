@@ -358,7 +358,7 @@ def build_heightfield_group():
                 ("Half Size", 'NodeSocketFloat', 0.15),
                 ("Resolution", 'NodeSocketInt', 160, 16, 1024),
                 ("Packing", 'NodeSocketFloat', 0.58),
-                ("Smoothing", 'NodeSocketInt', 2, 0, 20)),
+                ("Smoothing", 'NodeSocketInt', 2, 0, 40)),
         outputs=(("Height Field", 'NodeSocketGeometry'),))
     Lh = gi.outputs["Half Size"]
     G = gi.outputs["Resolution"]
@@ -530,12 +530,20 @@ def build_grain_step_group(chladni, sampler):
                      b.lt(vz, 0.02))
 
     # --- plate excitation ---------------------------------------------
-    ch = b.group(chladni, Position=P, M=I["M"], N=I["N"], Sign=I["Sign"],
+    # A real plate is never perfect: slight thickness/mounting variation bends
+    # the nodal lines a little and breaks the textbook symmetry.
+    wx = b.mul(Lh, b.add(b.mul(b.m('SINE', b.add(b.mul(b.div(py, Lh), 2.1), 0.7)), 0.012), 0.006))
+    wy = b.mul(Lh, b.sub(b.mul(b.m('SINE', b.add(b.mul(b.div(px, Lh), 1.6), 1.9)), 0.010), 0.004))
+    Pw = b.v('ADD', P, b.xyz(wx, wy, 0.0))
+    ch = b.group(chladni, Position=Pw, M=I["M"], N=I["N"], Sign=I["Sign"],
                  K=b.div(math.pi, Lh))
     F = ch.outputs["F"]
     gradF = ch.outputs["Gradient"]
     gamma = b.mul(I["Drive"], b.mul(b.m('ABSOLUTE', F), 0.5))
-    excess = b.mx(b.sub(gamma, 1.0), 0.0)
+    # per-grain static friction: a few angular grains wedge in micro-scratches
+    # and need more than 1 g to break free -> natural stragglers around ridges
+    grip = b.named("cf_grip")
+    excess = b.mx(b.sub(gamma, b.madd(grip, 2.5, 1.0)), 0.0)
     u1 = b.rand('FLOAT', 0.0, 1.0, idn, I["Seed"])
     p_launch = b.clamp01(b.mul(b.mul(excess, I["Launch Rate"]), dt))
     launch = b.AND(b.AND(grounded, onplate), b.lt(u1, p_launch))
@@ -587,12 +595,25 @@ def build_grain_step_group(chladni, sampler):
     fvz = b.switch('FLOAT', below, v1z, bvz)
     fz = b.switch('FLOAT', below, nz, floor_z)
 
-    # resting grains: sit on the pile, avalanche if slope > repose
-    smag = b.v('LENGTH', slope)
-    over = b.mx(b.sub(smag, I["Repose Tan"]), 0.0)
-    down = b.v('SCALE', b.v('NORMALIZE', slope),
-               scale=b.mul(b.mul(b.mul(over, I["Avalanche Speed"]), dt), -1.0))
-    dnx, dny, _ = b.sep(down)
+    # resting grains avalanche: probe the pile in a random direction and
+    # slide that way if the drop is steeper than the angle of repose. (A
+    # gradient test misses crests, where the measured slope is zero, which
+    # lets sand stack into unphysical spikes.)
+    cs = b.div(b.mul(Lh, 2.0), b.sub(I["Resolution"], 1.0))
+    # random probe length breaks any locking to the height-field lattice
+    probe_d = b.mul(b.mx(cs, b.mul(r, 2.0)),
+                    b.rand('FLOAT', 0.6, 2.2, idn, b.imath('ADD', I["Seed"], 505)))
+    pang = b.rand('FLOAT', 0.0, 6.2831853, idn, b.imath('ADD', I["Seed"], 404))
+    pdx = b.m('COSINE', pang)
+    pdy = b.m('SINE', pang)
+    probe = b.v('ADD', P, b.xyz(b.mul(pdx, probe_d), b.mul(pdy, probe_d), 0.0))
+    smp2 = b.group(sampler, **{"Height Field": I["Height Field"], "Position": probe,
+                               "Half Size": Lh, "Resolution": I["Resolution"]})
+    drop = b.div(b.sub(h, smp2.outputs["Height"]), probe_d)
+    over = b.mn(b.mx(b.sub(drop, I["Repose Tan"]), 0.0), 1.0)
+    slide = b.mul(b.mul(over, I["Avalanche Speed"]), dt)
+    dnx = b.mul(pdx, slide)
+    dny = b.mul(pdy, slide)
     # tiny settling shiver while the plate is excited but below 1 g
     shiver = b.mul(b.mul(b.clamp01(b.mul(gamma, 1.5)), dt), 0.0004)
     sj = b.rand('FLOAT_VECTOR', (-1.0, -1.0, 0.0), (1.0, 1.0, 0.0), idn,
@@ -601,7 +622,15 @@ def build_grain_step_group(chladni, sampler):
     # vibration creep: below 1 g grains still slide/roll down the oscillating
     # plate tilt towards the nodal line (stalls where the plate is still)
     dist = b.div(b.m('ABSOLUTE', F), b.mx(b.v('LENGTH', gradF), 1e-6))
-    creep = b.mn(b.mul(b.mul(b.clamp01(gamma), I["Creep"]), dt),
+    # ...but only while the pile ahead is not already at the angle of repose:
+    # sand packs up against the ridge and builds a true repose-angle mound.
+    ahead = b.v('ADD', P, b.v('SCALE', toward, scale=probe_d))
+    smp3 = b.group(sampler, **{"Height Field": I["Height Field"], "Position": ahead,
+                               "Half Size": Lh, "Resolution": I["Resolution"]})
+    rise = b.div(b.sub(smp3.outputs["Height"], h), probe_d)
+    free = b.clamp01(b.div(b.sub(I["Repose Tan"], rise), b.mul(I["Repose Tan"], 0.25)))
+    free = b.mul(free, b.mx(b.clamp01(b.sub(1.0, b.mul(grip, 1.6))), 0.1))
+    creep = b.mn(b.mul(b.mul(b.mul(b.clamp01(gamma), free), I["Creep"]), dt),
                  b.mx(b.sub(dist, b.mul(r, 0.5)), 0.0))
     cx = b.mul(tx, creep)
     cy = b.mul(ty, creep)
@@ -726,11 +755,11 @@ MAIN_INPUTS = (
      "Most intricate resonance used (high pitch)"),
     ("Pattern", "Mode Hysteresis", 'NodeSocketFloat', 0.8, 0.0, 4.0,
      "How far the pitch must move before the plate jumps to a new resonance"),
-    ("Sand", "Grain Count", 'NodeSocketInt', 200000, 100, 5000000,
+    ("Sand", "Grain Count", 'NodeSocketInt', 450000, 100, 5000000,
      "Number of grains sprinkled at the first frame"),
-    ("Sand", "Grain Radius", 'NodeSocketFloat', 0.00035, 0.00002, 0.02,
+    ("Sand", "Grain Radius", 'NodeSocketFloat', 0.00022, 0.00002, 0.02,
      "Mean grain radius in metres (fine sand ~0.15-0.4 mm)"),
-    ("Sand", "Size Variation", 'NodeSocketFloat', 0.4, 0.0, 0.9, ""),
+    ("Sand", "Size Variation", 'NodeSocketFloat', 0.3, 0.0, 0.9, ""),
     ("Sand", "Sprinkle Margin", 'NodeSocketFloat', 0.03, 0.0, 0.5,
      "Fraction of the plate edge left clean when sprinkling"),
     ("Sand", "Seed", 'NodeSocketInt', 0, 0, 100000, ""),
@@ -757,7 +786,7 @@ MAIN_INPUTS = (
      "Drop from the plate top to the table where spilled sand lands"),
     ("Plate", "Plate Size", 'NodeSocketFloat', 0.30, 0.01, 100.0,
      "Plate edge length (m). Must match the plate object"),
-    ("Plate", "Pile Resolution", 'NodeSocketInt', 192, 16, 1024,
+    ("Plate", "Pile Resolution", 'NodeSocketInt', 256, 16, 1024,
      "Cells per side of the sand height field"),
     ("Look", "Grain Material", 'NodeSocketMaterial', None, None, None, ""),
     ("Look", "Pile Material", 'NodeSocketMaterial', None, None, None, ""),
@@ -828,6 +857,8 @@ def build_main_tree(name, grain_shapes_tree):
                                                b.imath('ADD', seed, 3)))
     grains = b.store(grains, "cf_tint", b.rand('FLOAT', 0.0, 1.0, idx,
                                                b.imath('ADD', seed, 4)))
+    grains = b.store(grains, "cf_grip", b.m('POWER', b.rand(
+        'FLOAT', 0.0, 1.0, idx, b.imath('ADD', seed, 8)), 30.0))
     grains = b.store(grains, "cf_rand", b.rand('FLOAT', 0.0, 1.0, idx,
                                                b.imath('ADD', seed, 5)))
     grains = b.store(grains, "cf_rot", b.rand('FLOAT_VECTOR', (0.0, 0.0, 0.0),
@@ -945,7 +976,7 @@ def build_main_tree(name, grain_shapes_tree):
         "Node Attraction": I["Node Attraction"],
         "Restitution": I["Restitution"], "Friction": I["Friction"],
         "Repose Tan": repose_tan, "Creep": I["Creep"],
-        "Avalanche Speed": b.mul(I["Grain Radius"], 60.0)})
+        "Avalanche Speed": b.mul(I["Grain Radius"], 150.0)})
     b.L.new(stp.outputs[0], rout.inputs["Geometry"])
 
     b.L.new(rout.outputs["Geometry"], sim_out.inputs["Geometry"])
@@ -969,13 +1000,11 @@ def build_main_tree(name, grain_shapes_tree):
     pile = O["Pile"]
     hp = b.named("cf_h")
     ppx, ppy, _ = b.sep(b.pos())
-    body_z = b.mx(b.sub(hp, b.mul(I["Grain Radius"], 1.4)), -0.0006)
+    # A continuous surface (no trimmed cells -> no saw-tooth edges): where
+    # there is little sand it dips smoothly below the plate top and is hidden
+    # inside the 1.5 mm plate.
+    body_z = b.mx(b.sub(hp, b.mul(I["Grain Radius"], 2.4)), -0.0009)
     pile = b.set_pos(pile, position=b.xyz(ppx, ppy, body_z))
-    # trim cells that hold no sand at all
-    del_n = b.node("GeometryNodeDeleteGeometry", domain='POINT')
-    b.feed(del_n.inputs["Geometry"], pile)
-    b.feed(del_n.inputs["Selection"], b.lt(hp, b.mul(I["Grain Radius"], 0.9)))
-    pile = del_n.outputs[0]
     smooth = b.node("GeometryNodeSetShadeSmooth")
     b.feed(smooth.inputs["Geometry"], pile)
     pile = smooth.outputs[0]
@@ -1330,27 +1359,25 @@ def _palette_group(kind):
         # beach / play sand: mostly quartz (clear, milky, tan, iron-stained),
         # feldspar (pink/cream), lithic grey and dark heavy minerals.
         col = _ramp(g, tint, [
-            (0.00, (0.56, 0.51, 0.43, 1)),   # milky quartz
-            (0.20, (0.50, 0.40, 0.27, 1)),   # tan quartz
-            (0.42, (0.60, 0.57, 0.52, 1)),   # clear / frosted quartz
-            (0.55, (0.42, 0.26, 0.13, 1)),   # iron-stained amber
-            (0.66, (0.56, 0.45, 0.32, 1)),   # buff
-            (0.76, (0.31, 0.30, 0.28, 1)),   # lithic grey
-            (0.83, (0.60, 0.40, 0.33, 1)),   # pink feldspar
-            (0.90, (0.68, 0.62, 0.53, 1)),   # cream feldspar
-            (0.95, (0.035, 0.032, 0.03, 1)),  # magnetite / ilmenite
+            (0.00, (0.70, 0.62, 0.49, 1)),   # cream silica
+            (0.30, (0.74, 0.69, 0.60, 1)),   # milky / frosted quartz
+            (0.52, (0.62, 0.58, 0.51, 1)),   # clear quartz (darker: see-through)
+            (0.64, (0.66, 0.56, 0.41, 1)),   # light tan
+            (0.86, (0.72, 0.66, 0.56, 1)),   # off-white
+            (0.94, (0.55, 0.43, 0.29, 1)),   # rare amber, iron-stained
+            (0.978, (0.09, 0.085, 0.08, 1)),  # rare dark heavy mineral
         ], "CONSTANT", -300, 300)
-        # per-grain value/saturation jitter
+        # per-grain value/saturation jitter (kept low: demo sand is uniform)
         hsv = _n(g, "ShaderNodeHueSaturation", 0, 300)
-        _feed(g, hsv.inputs["Hue"], _maprange(g, r3, 0, 1, 0.48, 0.52, -150, 450))
-        _feed(g, hsv.inputs["Saturation"], _maprange(g, r2, 0, 1, 0.9, 1.45, -150, 150))
-        _feed(g, hsv.inputs["Value"], _maprange(g, rnd, 0, 1, 0.85, 1.3, -150, 0))
+        _feed(g, hsv.inputs["Hue"], _maprange(g, r3, 0, 1, 0.49, 0.51, -150, 450))
+        _feed(g, hsv.inputs["Saturation"], _maprange(g, r2, 0, 1, 0.85, 1.15, -150, 150))
+        _feed(g, hsv.inputs["Value"], _maprange(g, rnd, 0, 1, 0.86, 1.14, -150, 0))
         g.links.new(col, hsv.inputs["Color"])
         col = hsv.outputs[0]
-        dark = _math(g, "GREATER_THAN", tint, 0.95, x=-300, y=-600)
+        dark = _math(g, "GREATER_THAN", tint, 0.978, x=-300, y=-600)
         clear = _math(g, "MULTIPLY",
-                      _math(g, "GREATER_THAN", tint, 0.42, x=-500, y=-750),
-                      _math(g, "LESS_THAN", tint, 0.55, x=-500, y=-850), x=-300, y=-750)
+                      _math(g, "GREATER_THAN", tint, 0.52, x=-500, y=-750),
+                      _math(g, "LESS_THAN", tint, 0.64, x=-500, y=-850), x=-300, y=-750)
         rough = _maprange(g, r2, 0, 1, 0.32, 0.6, -300, 0)
         # clear quartz is glossier, occasional fresh-fracture grain sparkles
         glint = _math(g, "MAXIMUM", _math(g, "GREATER_THAN", r3, 0.86, x=-300, y=-900), clear, x=-150, y=-900)
@@ -1429,7 +1456,7 @@ def make_grain_material(kind="SAND"):
     return m
 
 
-def make_fill_material(kind="SAND"):
+def make_fill_material(kind="SAND", grain_radius=None):
     """Heightfield 'body' under the grains: granular at ~0.7 mm, same palette."""
     kind = (kind or "SAND").upper()
     m = _new_material(PREFIX + "Fill_" + kind)
@@ -1437,6 +1464,8 @@ def make_fill_material(kind="SAND"):
     tc = _n(nt, "ShaderNodeTexCoord", -1400, 0)
     pos = tc.outputs["Object"]
     cell = 0.00072 if kind == "SAND" else 0.0010
+    if grain_radius:
+        cell = grain_radius * (2.0 if kind == "SAND" else 2.8)
     vor = _n(nt, "ShaderNodeTexVoronoi", -1150, 0, feature="F1", voronoi_dimensions="3D")
     nt.links.new(pos, vor.inputs["Vector"])
     vor.inputs["Scale"].default_value = 1.0 / cell
@@ -1449,9 +1478,9 @@ def make_fill_material(kind="SAND"):
     nt.links.new(sep.outputs[1], pal.inputs["Rand"])
     # pile thickness -> occlusion (gaps between surface grains look into shadowed depth)
     ah = _n(nt, "ShaderNodeAttribute", -1150, -400, attribute_name="cf_h", attribute_type="GEOMETRY")
-    occ = _maprange(nt, ah.outputs["Factor"], 0.0, 0.0018, 0.30, 0.62, -950, -400, interp="SMOOTHSTEP")
+    occ = _maprange(nt, ah.outputs["Factor"], 0.0, 0.0018, 0.28, 0.6, -950, -400, interp="SMOOTHSTEP")
     # darken toward cell borders (the crevices between grains)
-    crev = _maprange(nt, vor.outputs["Distance"], 0.15, 0.55, 1.0, 0.45, -950, -250, interp="SMOOTHSTEP")
+    crev = _maprange(nt, vor.outputs["Distance"], 0.1, 0.5, 1.0, 0.22, -950, -250, interp="SMOOTHSTEP")
     shade = _math(nt, "MULTIPLY", occ, crev, x=-750, y=-300)
     col = _mix(nt, 1.0, pal.outputs["Color"], shade, "RGBA", "MULTIPLY", -450, 100)
     b = _n(nt, "ShaderNodeBsdfPrincipled", -150, 100)
@@ -2165,10 +2194,10 @@ class CymaticProps(bpy.types.PropertyGroup):
         name="Plate Height", default=0.14, min=0.01, soft_max=1.0, unit='LENGTH',
         description="Height of the plate top above the table")
     grain_count: IntProperty(
-        name="Grains", default=200000, min=1000, soft_max=1000000,
-        description="Number of grains (200k = ~1 tablespoon of fine sand)")
+        name="Grains", default=450000, min=1000, soft_max=1000000,
+        description="Number of grains (450k fine grains = ~1 teaspoon of sand)")
     grain_radius: FloatProperty(
-        name="Grain Radius", default=0.00035, min=0.00002, soft_max=0.003,
+        name="Grain Radius", default=0.00022, min=0.00002, soft_max=0.003,
         precision=5, unit='LENGTH',
         description="Mean grain radius (fine sand 0.15-0.4 mm)")
     build_studio: BoolProperty(
@@ -2291,7 +2320,7 @@ class CYMATICS_OT_build(bpy.types.Operator):
         mod.node_group = tree
 
         gmat = make_grain_material(p.grain_kind)
-        fmat = make_fill_material(p.grain_kind)
+        fmat = make_fill_material(p.grain_kind, p.grain_radius)
         _set_input(mod, "Sound", sound)
         _set_input(mod, "Grain Material", gmat)
         _set_input(mod, "Pile Material", fmat)
