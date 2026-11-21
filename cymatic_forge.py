@@ -1022,20 +1022,39 @@ def build_main_tree(name, grain_shapes_tree):
     b.feed(shp_mat.inputs["Material"], I["Grain Material"])
     shp = shp_mat.outputs[0]
 
-    # Grains in flight become a point cloud carrying a 'velocity' attribute,
-    # which Cycles turns into true shutter motion blur (instances get none).
-    # Resting / creeping grains stay real instanced grain meshes.
+    # Grains in flight are drawn as their shutter streak: a short curve over
+    # the path travelled during a 180-degree shutter (1/(2 fps) s), fading in
+    # proportion so the grain's light is spread along it like real motion
+    # blur. (Cycles' true motion blur on thousands of tiny fast points is
+    # ~10x slower; this matches it visually at normal cost.) Resting and
+    # creeping grains stay real instanced grain meshes.
     flying_sel = b.gt(b.v('LENGTH', b.named("cf_vel", 'FLOAT_VECTOR')), 0.02)
     split = b.node("GeometryNodeSeparateGeometry", domain='POINT')
     b.feed(split.inputs["Geometry"], grains_out)
     b.feed(split.inputs["Selection"], flying_sel)
-    fly_pts = b.store(split.outputs["Selection"], "velocity",
-                      b.named("cf_vel", 'FLOAT_VECTOR'), 'FLOAT_VECTOR')
-    fr = b.node("GeometryNodeSetPointRadius")
-    b.feed(fr.inputs["Points"], fly_pts)
-    b.feed(fr.inputs["Radius"], b.mul(b.named("cf_rad"), 0.9))
+    fly = b.store(split.outputs["Selection"], "cf_gid", b.index(), 'INT')
+    dup = b.node("GeometryNodeDuplicateElements", domain='POINT')
+    b.feed(dup.inputs["Geometry"], fly)
+    b.feed(dup.inputs["Amount"], 2)
+    st_t = b.node("GeometryNodeInputSceneTime")
+    shutter = b.mul(b.div(st_t.outputs["Seconds"], b.mx(st_t.outputs["Frame"], 1.0)), 0.5)
+    vel = b.named("cf_vel", 'FLOAT_VECTOR')
+    along = b.mul(b.sub(dup.outputs["Duplicate Index"], 0.5), shutter)
+    ends = b.set_pos(dup.outputs["Geometry"], offset=b.v('SCALE', vel, scale=along))
+    p2c = b.node("GeometryNodePointsToCurves")
+    b.feed(p2c.inputs["Points"], ends)
+    b.feed(p2c.inputs["Curve Group ID"], b.named("cf_gid", 'INT'))
+    b.feed(p2c.inputs["Weight"], dup.outputs["Duplicate Index"])
+    streak_len = b.mul(b.v('LENGTH', vel), shutter)
+    rr = b.mul(b.named("cf_rad"), 0.85)
+    fade = b.sub(1.0, b.clamp01(b.div(b.mul(rr, 2.0), b.add(streak_len, b.mul(rr, 2.0)))))
+    crv = b.store(p2c.outputs["Curves"], "cf_fade", fade)
+    crv = b.store(crv, "velocity", vel, 'FLOAT_VECTOR')
+    rad = b.node("GeometryNodeSetCurveRadius")
+    b.feed(rad.inputs["Curve"], crv)
+    b.feed(rad.inputs["Radius"], rr)
     fmat = b.node("GeometryNodeSetMaterial")
-    b.feed(fmat.inputs["Geometry"], fr.outputs[0])
+    b.feed(fmat.inputs["Geometry"], rad.outputs[0])
     b.feed(fmat.inputs["Material"], I["Grain Material"])
     flying = fmat.outputs[0]
 
@@ -1477,8 +1496,15 @@ def make_grain_material(kind="SAND"):
               _math(nt, "MULTIPLY", _math(nt, "SUBTRACT", nz.outputs["Factor"], 0.5, x=-450, y=-800), 0.25,
                     x=-300, y=-800), x=-150, y=-700, clamp=True)
     nt.links.new(r, b.inputs["Roughness"])
-    o = _n(nt, "ShaderNodeOutputMaterial", 200, 200)
-    nt.links.new(b.outputs[0], o.inputs["Surface"])
+    # motion-blur streaks of flying grains carry cf_fade (0 on resting grains)
+    fd = _n(nt, "ShaderNodeAttribute", -150, 450, attribute_name="cf_fade", attribute_type="GEOMETRY")
+    tr = _n(nt, "ShaderNodeBsdfTransparent", 0, 450)
+    mixs = _n(nt, "ShaderNodeMixShader", 100, 300)
+    nt.links.new(fd.outputs["Factor"], mixs.inputs[0])
+    nt.links.new(b.outputs[0], mixs.inputs[1])
+    nt.links.new(tr.outputs[0], mixs.inputs[2])
+    o = _n(nt, "ShaderNodeOutputMaterial", 300, 200)
+    nt.links.new(mixs.outputs[0], o.inputs["Surface"])
     return m
 
 
@@ -1955,13 +1981,9 @@ def _render_settings(scene):
     r.resolution_x, r.resolution_y = 1920, 1080
     r.resolution_percentage = 100
     r.film_transparent = False
-    # 180-degree shutter like a real video camera: grains in flight streak
-    r.use_motion_blur = True
-    r.motion_blur_shutter = 0.5
-    try:
-        r.motion_blur_position = 'CENTER'
-    except (AttributeError, TypeError):
-        pass
+    # Flying grains carry their own 180-degree-shutter streaks (see the
+    # sim tree), so scene motion blur stays off: it is ~10x slower on sand.
+    r.use_motion_blur = False
     vs = scene.view_settings
     vs.view_transform = "AgX"
     try:
