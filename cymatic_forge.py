@@ -1022,11 +1022,28 @@ def build_main_tree(name, grain_shapes_tree):
     b.feed(shp_mat.inputs["Material"], I["Grain Material"])
     shp = shp_mat.outputs[0]
 
+    # Grains in flight become a point cloud carrying a 'velocity' attribute,
+    # which Cycles turns into true shutter motion blur (instances get none).
+    # Resting / creeping grains stay real instanced grain meshes.
+    flying_sel = b.gt(b.v('LENGTH', b.named("cf_vel", 'FLOAT_VECTOR')), 0.02)
+    split = b.node("GeometryNodeSeparateGeometry", domain='POINT')
+    b.feed(split.inputs["Geometry"], grains_out)
+    b.feed(split.inputs["Selection"], flying_sel)
+    fly_pts = b.store(split.outputs["Selection"], "velocity",
+                      b.named("cf_vel", 'FLOAT_VECTOR'), 'FLOAT_VECTOR')
+    fr = b.node("GeometryNodeSetPointRadius")
+    b.feed(fr.inputs["Points"], fly_pts)
+    b.feed(fr.inputs["Radius"], b.mul(b.named("cf_rad"), 0.9))
+    fmat = b.node("GeometryNodeSetMaterial")
+    b.feed(fmat.inputs["Geometry"], fr.outputs[0])
+    b.feed(fmat.inputs["Material"], I["Grain Material"])
+    flying = fmat.outputs[0]
+
     count_inst = b.node("GeometryNodeAttributeDomainSize", component='INSTANCES')
     b.feed(count_inst.inputs["Geometry"], shp)
     n_inst = count_inst.outputs["Instance Count"]
     iop = b.node("GeometryNodeInstanceOnPoints")
-    b.feed(iop.inputs["Points"], grains_out)
+    b.feed(iop.inputs["Points"], split.outputs["Inverted"])
     b.feed(iop.inputs["Instance"], shp)
     iop.inputs["Pick Instance"].default_value = True
     pick = b.rand('INT', 0, b.imath('SUBTRACT', n_inst, 1),
@@ -1037,7 +1054,10 @@ def build_main_tree(name, grain_shapes_tree):
     # slightly flattened, elongated grains
     sx = b.rand('FLOAT', 0.85, 1.25, b.node("GeometryNodeInputID").outputs[0], 23)
     b.feed(iop.inputs["Scale"], b.v('SCALE', b.xyz(sx, 1.0, 0.8), scale=rs))
-    inst = iop.outputs["Instances"]
+    rjoin = b.node("GeometryNodeJoinGeometry")
+    b.L.new(iop.outputs["Instances"], rjoin.inputs[0])
+    b.L.new(flying, rjoin.inputs[0])
+    inst = rjoin.outputs[0]
 
     # viewport proxy: points with radius
     pr = b.node("GeometryNodeSetPointRadius")
@@ -1413,10 +1433,16 @@ def make_grain_material(kind="SAND"):
     nt = m.node_tree
     a_t = _n(nt, "ShaderNodeAttribute", -1200, 200, attribute_name="cf_tint", attribute_type="INSTANCER")
     a_r = _n(nt, "ShaderNodeAttribute", -1200, 0, attribute_name="cf_rand", attribute_type="INSTANCER")
+    # airborne grains are a point cloud (for motion blur), not instances:
+    # read the same attributes from the geometry too (one of the two is 0)
+    g_t = _n(nt, "ShaderNodeAttribute", -1200, 400, attribute_name="cf_tint", attribute_type="GEOMETRY")
+    g_r = _n(nt, "ShaderNodeAttribute", -1200, -150, attribute_name="cf_rand", attribute_type="GEOMETRY")
+    tint = _math(nt, "ADD", a_t.outputs["Factor"], g_t.outputs["Factor"], x=-1050, y=250, clamp=True)
+    rnd = _math(nt, "ADD", a_r.outputs["Factor"], g_r.outputs["Factor"], x=-1050, y=50, clamp=True)
     pal = _n(nt, "ShaderNodeGroup", -900, 100)
     pal.node_tree = _palette_group(kind)
-    nt.links.new(a_t.outputs["Factor"], pal.inputs["Tint"])
-    nt.links.new(a_r.outputs["Factor"], pal.inputs["Rand"])
+    nt.links.new(tint, pal.inputs["Tint"])
+    nt.links.new(rnd, pal.inputs["Rand"])
     b = _grain_bsdf(nt, pal, -300, 200, 0.00018 if kind == "SAND" else 0.0004)
     # glassy grains (clear quartz / rock salt) partly transmit
     _feed(nt, b.inputs["Transmission Weight"],
@@ -1426,7 +1452,7 @@ def make_grain_material(kind="SAND"):
     # surface micro texture in grain-local space (grain radius == 1 in object space)
     tc = _n(nt, "ShaderNodeTexCoord", -1200, -300)
     off = _vmath(nt, "SCALE", _n(nt, "ShaderNodeCombineXYZ", -1050, -450).outputs[0], None, -900, -450,
-                 scale=_math(nt, "MULTIPLY", a_r.outputs["Factor"], 100.0, x=-1050, y=-600))
+                 scale=_math(nt, "MULTIPLY", rnd, 100.0, x=-1050, y=-600))
     p = _vmath(nt, "ADD", tc.outputs["Object"], off, -750, -300)
     if kind == "SALT":
         # stepped / hopper-crystal terraces + frosting
@@ -1929,6 +1955,13 @@ def _render_settings(scene):
     r.resolution_x, r.resolution_y = 1920, 1080
     r.resolution_percentage = 100
     r.film_transparent = False
+    # 180-degree shutter like a real video camera: grains in flight streak
+    r.use_motion_blur = True
+    r.motion_blur_shutter = 0.5
+    try:
+        r.motion_blur_position = 'CENTER'
+    except (AttributeError, TypeError):
+        pass
     vs = scene.view_settings
     vs.view_transform = "AgX"
     try:
